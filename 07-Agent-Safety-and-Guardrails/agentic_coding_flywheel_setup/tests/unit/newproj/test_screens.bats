@@ -1,0 +1,716 @@
+#!/usr/bin/env bats
+# ============================================================
+# Unit Tests for newproj_screens - Wizard Screen Modules
+# ============================================================
+
+load '../test_helper'
+
+setup() {
+    common_setup
+
+    # Create temp directory for testing
+    TEST_DIR=$(create_temp_dir)
+    export TEST_DIR
+
+    # Set up logging
+    export ACFS_LOG_DIR="$TEST_DIR/logs"
+    mkdir -p "$ACFS_LOG_DIR"
+    export ACFS_LOG_LEVEL=0
+
+    # Create screens directory structure for testing
+    export NEWPROJ_LIB_DIR="$ACFS_LIB_DIR"
+
+    # Source dependencies
+    source_lib "newproj_logging"
+    init_logging
+
+    # Mock terminal capabilities for testing
+    export TERM_HAS_COLOR=false
+    export TERM_HAS_UNICODE=false
+    export GUM_AVAILABLE=false
+    export TERM_COLS=80
+    export TERM_LINES=24
+}
+
+teardown() {
+    common_teardown
+}
+
+# ============================================================
+# Screen Manager Tests
+# ============================================================
+
+@test "newproj_screens.sh sources without error" {
+    run source_lib "newproj_screens"
+    assert_success
+}
+
+@test "load_screens loads all screen files" {
+    source_lib "newproj_screens"
+
+    run load_screens
+    assert_success
+}
+
+@test "SCREEN_FLOW contains all screens" {
+    source_lib "newproj_screens"
+
+    [[ ${#SCREEN_FLOW[@]} -eq 9 ]]
+    [[ "${SCREEN_FLOW[0]}" == "welcome" ]]
+    [[ "${SCREEN_FLOW[8]}" == "success" ]]
+}
+
+@test "SCREEN_RUNNERS maps to valid functions" {
+    source_lib "newproj_screens"
+    load_screens
+
+    for screen_id in "${!SCREEN_RUNNERS[@]}"; do
+        local runner="${SCREEN_RUNNERS[$screen_id]}"
+        declare -f "$runner" &>/dev/null
+    done
+}
+
+@test "get_screen_runner returns correct function" {
+    source_lib "newproj_screens"
+
+    local runner
+    runner=$(get_screen_runner "welcome")
+    [[ "$runner" == "run_welcome_screen" ]]
+
+    runner=$(get_screen_runner "project_name")
+    [[ "$runner" == "run_project_name_screen" ]]
+}
+
+@test "get_next_screen returns correct screen" {
+    source_lib "newproj_screens"
+
+    local next
+    next=$(get_next_screen "welcome")
+    [[ "$next" == "project_name" ]]
+
+    next=$(get_next_screen "project_name")
+    [[ "$next" == "directory" ]]
+
+    next=$(get_next_screen "progress")
+    [[ "$next" == "success" ]]
+}
+
+@test "get_previous_screen returns correct screen" {
+    source_lib "newproj_screens"
+
+    local prev
+    prev=$(get_previous_screen "project_name")
+    [[ "$prev" == "welcome" ]]
+
+    prev=$(get_previous_screen "success")
+    [[ "$prev" == "progress" ]]
+}
+
+@test "get_next_screen returns empty for last screen" {
+    source_lib "newproj_screens"
+
+    local next
+    next=$(get_next_screen "success") || true
+    [[ -z "$next" ]]
+}
+
+@test "run_wizard executes success screen before exiting" {
+    source_lib "newproj_screens"
+
+    tui_init() { return 0; }
+    tui_cleanup() { :; }
+    load_screens() { return 0; }
+    run_screen() {
+        case "$1" in
+            welcome)
+                CURRENT_SCREEN="success"
+                return 0
+                ;;
+            success)
+                echo "success-screen-ran"
+                return 0
+                ;;
+        esac
+        return 1
+    }
+
+    run run_wizard
+    assert_success
+    [[ "$output" == *"success-screen-ran"* ]]
+}
+
+# ============================================================
+# Welcome Screen Tests
+# ============================================================
+
+@test "welcome screen module loads" {
+    source_lib "newproj_tui"
+    source_lib "newproj_errors"
+    setup_colors
+    setup_box_chars
+
+    source "$ACFS_LIB_DIR/newproj_screens/screen_welcome.sh"
+
+    [[ "$SCREEN_WELCOME_ID" == "welcome" ]]
+    [[ "$SCREEN_WELCOME_NEXT" == "project_name" ]]
+}
+
+@test "welcome screen metadata is correct" {
+    source_lib "newproj_screens"
+    load_screens
+
+    [[ "$SCREEN_WELCOME_STEP" -eq 1 ]]
+    [[ "$SCREEN_WELCOME_TITLE" == "Welcome" ]]
+}
+
+@test "render_welcome_screen produces output" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local output
+    output=$(render_welcome_screen 2>&1 | head -20)
+
+    [[ "$output" == *"ACFS"* ]]
+    [[ "$output" == *"Welcome"* ]]
+}
+
+# ============================================================
+# Project Name Screen Tests
+# ============================================================
+
+@test "project name screen module loads" {
+    source_lib "newproj_screens"
+    load_screens
+
+    [[ "$SCREEN_PROJECT_NAME_ID" == "project_name" ]]
+    [[ "$SCREEN_PROJECT_NAME_NEXT" == "directory" ]]
+}
+
+@test "get_default_project_name returns valid name" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local default_name
+    default_name=$(get_default_project_name)
+
+    # Should return something
+    [[ -n "$default_name" ]]
+}
+
+@test "render_project_name_screen produces output" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local output
+    output=$(render_project_name_screen "my-project" 2>&1 | head -20)
+
+    [[ "$output" == *"Project Name"* ]]
+    [[ "$output" == *"my-project"* ]]
+}
+
+# ============================================================
+# Directory Screen Tests
+# ============================================================
+
+@test "directory screen module loads" {
+    source_lib "newproj_screens"
+    load_screens
+
+    [[ "$SCREEN_DIRECTORY_ID" == "directory" ]]
+    [[ "$SCREEN_DIRECTORY_NEXT" == "tech_stack" ]]
+}
+
+@test "get_default_projects_dir returns valid path" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local default_dir
+    default_dir=$(get_default_projects_dir)
+
+    # Should return a valid directory
+    [[ -d "$default_dir" ]] || [[ "$default_dir" == "$HOME" ]]
+}
+
+@test "check_directory_status returns OK for new path" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local new_path="$TEST_DIR/new-project-$(date +%s)"
+
+    local status
+    status=$(check_directory_status "$new_path")
+
+    [[ "$status" == "OK:"* ]]
+}
+
+@test "check_directory_status returns ERROR for existing non-empty dir" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local existing_dir="$TEST_DIR/existing"
+    mkdir -p "$existing_dir"
+    echo "test" > "$existing_dir/file.txt"
+
+    local status
+    status=$(check_directory_status "$existing_dir") || true
+
+    [[ "$status" == "ERROR:"* ]]
+}
+
+@test "check_directory_status returns WARNING for empty dir" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local empty_dir="$TEST_DIR/empty"
+    mkdir -p "$empty_dir"
+
+    local status
+    status=$(check_directory_status "$empty_dir") || true
+
+    [[ "$status" == "WARNING:"* ]]
+}
+
+@test "check_directory_status rejects existing directory without write access" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local locked_dir="$TEST_DIR/locked"
+    mkdir -p "$locked_dir"
+    chmod 500 "$locked_dir"
+
+    local status
+    status=$(check_directory_status "$locked_dir") || true
+
+    chmod 700 "$locked_dir"
+
+    [[ "$status" == "ERROR:Cannot write to existing directory:"* ]]
+}
+
+@test "check_directory_status rejects parent directory without search access" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local parent_dir="$TEST_DIR/no-search-parent"
+    mkdir -p "$parent_dir"
+    chmod 200 "$parent_dir"
+
+    local status
+    status=$(check_directory_status "$parent_dir/project") || true
+
+    chmod 700 "$parent_dir"
+
+    [[ "$status" == "ERROR:Cannot create entries in parent directory:"* ]]
+}
+
+@test "check_directory_status expands tilde" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local tilde_path=~/nonexistent-project-test-123
+    local status
+    status=$(check_directory_status "$tilde_path")
+
+    # Should have resolved the tilde
+    [[ "$status" != *"~"* ]]
+}
+
+# ============================================================
+# Tech Stack Screen Tests
+# ============================================================
+
+@test "tech stack screen module loads" {
+    source_lib "newproj_screens"
+    load_screens
+
+    [[ "$SCREEN_TECH_STACK_ID" == "tech_stack" ]]
+    [[ ${#TECH_STACK_OPTIONS[@]} -gt 0 ]]
+}
+
+@test "TECH_STACK_OPTIONS contains expected options" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local found_nodejs=false
+    local found_python=false
+
+    for opt in "${TECH_STACK_OPTIONS[@]}"; do
+        [[ "$opt" == "nodejs:"* ]] && found_nodejs=true
+        [[ "$opt" == "python:"* ]] && found_python=true
+    done
+
+    [[ "$found_nodejs" == "true" ]]
+    [[ "$found_python" == "true" ]]
+}
+
+@test "get_tech_option_display returns correct name" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local display
+    display=$(get_tech_option_display "nodejs")
+    [[ "$display" == *"Node.js"* ]]
+
+    display=$(get_tech_option_display "python")
+    [[ "$display" == *"Python"* ]]
+}
+
+@test "toggle_option adds new option" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local result
+    result=$(toggle_option "python" "nodejs")
+    [[ "$result" == *"python"* ]]
+    [[ "$result" == *"nodejs"* ]]
+}
+
+@test "toggle_option removes existing option" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local result
+    result=$(toggle_option "nodejs" "nodejs python")
+    [[ "$result" != *"nodejs"* ]]
+    [[ "$result" == *"python"* ]]
+}
+
+# ============================================================
+# Features Screen Tests
+# ============================================================
+
+@test "features screen module loads" {
+    source_lib "newproj_screens"
+    load_screens
+
+    [[ "$SCREEN_FEATURES_ID" == "features" ]]
+    [[ ${#FEATURE_OPTIONS[@]} -gt 0 ]]
+}
+
+@test "FEATURE_OPTIONS contains expected features" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local found_br=false
+    local found_agents=false
+
+    for opt in "${FEATURE_OPTIONS[@]}"; do
+        [[ "$opt" == "br:"* ]] && found_br=true
+        [[ "$opt" == "agents:"* ]] && found_agents=true
+    done
+
+    [[ "$found_br" == "true" ]]
+    [[ "$found_agents" == "true" ]]
+}
+
+@test "get_feature_key returns correct key" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local key
+    key=$(get_feature_key "br")
+    [[ "$key" == "enable_br" ]]
+
+    key=$(get_feature_key "agents")
+    [[ "$key" == "enable_agents" ]]
+}
+
+@test "toggle_feature changes state" {
+    source_lib "newproj_screens"
+    load_screens
+
+    state_set "enable_br" "true"
+    toggle_feature "br"
+    [[ "$(state_get "enable_br")" == "false" ]]
+
+    toggle_feature "br"
+    [[ "$(state_get "enable_br")" == "true" ]]
+}
+
+# ============================================================
+# Agents Preview Screen Tests
+# ============================================================
+
+@test "agents preview screen module loads" {
+    source_lib "newproj_screens"
+    load_screens
+
+    [[ "$SCREEN_AGENTS_PREVIEW_ID" == "agents_preview" ]]
+}
+
+@test "generate_preview_content produces content" {
+    source_lib "newproj_screens"
+    load_screens
+
+    state_set "project_name" "test-project"
+    state_set "tech_stack" "nodejs"
+
+    local content
+    content=$(generate_preview_content)
+
+    [[ -n "$content" ]]
+    [[ "$content" == *"AGENTS.md"* ]]
+}
+
+@test "get_preview_summary shows sections" {
+    source_lib "newproj_screens"
+    load_screens
+
+    state_set "project_name" "test-project"
+    state_set "tech_stack" "nodejs python"
+
+    local summary
+    summary=$(get_preview_summary)
+
+    [[ "$summary" == *"Sections"* ]]
+}
+
+# ============================================================
+# Confirmation Screen Tests
+# ============================================================
+
+@test "confirmation screen module loads" {
+    source_lib "newproj_screens"
+    load_screens
+
+    [[ "$SCREEN_CONFIRMATION_ID" == "confirmation" ]]
+}
+
+@test "confirmation edit returns to project name with reset history" {
+    source_lib "newproj_screens"
+    load_screens
+
+    handle_confirmation_input() {
+        return 3
+    }
+
+    CURRENT_SCREEN="confirmation"
+    SCREEN_HISTORY=("welcome" "project_name" "directory" "tech_stack" "features" "agents_preview")
+
+    run_confirmation_screen
+    local result=$?
+
+    [[ "$result" -eq 0 ]]
+
+    [[ "$CURRENT_SCREEN" == "project_name" ]]
+    [[ ${#SCREEN_HISTORY[@]} -eq 1 ]]
+    [[ "${SCREEN_HISTORY[0]}" == "welcome" ]]
+}
+
+@test "get_files_to_create returns file list" {
+    source_lib "newproj_screens"
+    load_screens
+
+    state_set "project_dir" "/tmp/test-project"
+    state_set "enable_agents" "true"
+    state_set "enable_br" "true"
+
+    local files
+    files=$(get_files_to_create)
+
+    [[ "$files" == *"AGENTS.md"* ]]
+    [[ "$files" == *".beads"* ]]
+}
+
+@test "get_files_to_create respects disabled features" {
+    source_lib "newproj_screens"
+    load_screens
+
+    state_set "project_dir" "/tmp/test-project"
+    state_set "enable_agents" "false"
+    state_set "enable_br" "false"
+
+    local files
+    files=$(get_files_to_create)
+
+    [[ "$files" != *"AGENTS.md"* ]]
+    [[ "$files" != *".beads"* ]]
+}
+
+@test "get_files_to_create omits Claude local settings when legacy config exists" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local project_dir="$TEST_DIR/existing-claude-project"
+    mkdir -p "$project_dir/.claude"
+    printf '[permissions]\n' > "$project_dir/.claude/settings.toml"
+
+    state_set "project_dir" "$project_dir"
+    state_set "enable_claude" "true"
+
+    local files
+    files=$(get_files_to_create)
+
+    [[ "$files" == *".claude/"* ]]
+    [[ "$files" != *".claude/settings.local.json"* ]]
+}
+
+# ============================================================
+# Progress Screen Tests
+# ============================================================
+
+@test "progress screen module loads" {
+    source_lib "newproj_screens"
+    load_screens
+
+    [[ "$SCREEN_PROGRESS_ID" == "progress" ]]
+}
+
+@test "init_creation_steps creates step list" {
+    source_lib "newproj_screens"
+    load_screens
+
+    state_set "enable_agents" "true"
+    state_set "enable_br" "false"
+
+    init_creation_steps
+
+    [[ ${#STEP_ORDER[@]} -gt 0 ]]
+    [[ " ${STEP_ORDER[*]} " =~ " create_dir " ]]
+    [[ " ${STEP_ORDER[*]} " =~ " init_git " ]]
+    [[ " ${STEP_ORDER[*]} " =~ " create_agents " ]]
+    [[ ! " ${STEP_ORDER[*]} " =~ " init_br " ]]
+}
+
+@test "get_step_name returns readable names" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local name
+    name=$(get_step_name "create_dir")
+    [[ "$name" == *"directory"* ]]
+
+    name=$(get_step_name "init_git")
+    [[ "$name" == *"Git"* ]]
+}
+
+@test "create_claude step skips when legacy Claude settings already exist" {
+    source_lib "newproj_screens"
+    load_screens
+
+    local project_dir="$TEST_DIR/existing-legacy-claude"
+    mkdir -p "$project_dir/.claude"
+    printf '[permissions]\n' > "$project_dir/.claude/settings.toml"
+
+    state_set "project_dir" "$project_dir"
+    state_set "project_name" "existing-legacy-claude"
+
+    render_progress_screen() { :; }
+
+    execute_step create_claude
+
+    [[ -f "$project_dir/.claude/settings.toml" ]]
+    [[ ! -f "$project_dir/.claude/settings.local.json" ]]
+    [[ "${STEP_STATUS[create_claude]}" == "success" ]]
+}
+
+# ============================================================
+# Success Screen Tests
+# ============================================================
+
+@test "success screen module loads" {
+    source_lib "newproj_screens"
+    load_screens
+
+    [[ "$SCREEN_SUCCESS_ID" == "success" ]]
+    [[ "$SCREEN_SUCCESS_STEP" -eq 9 ]]
+}
+
+@test "render_success_screen produces output" {
+    source_lib "newproj_screens"
+    load_screens
+
+    state_set "project_name" "test-project"
+    state_set "project_dir" "/tmp/test-project"
+
+    local output
+    output=$(render_success_screen 2>&1 | head -30)
+
+    [[ "$output" == *"SUCCESS"* ]] || [[ "$output" == *"Created"* ]]
+}
+
+@test "handle_success_input keeps prompting when Claude launch fails" {
+    run bash -c '
+        set -euo pipefail
+        export NEWPROJ_LIB_DIR="'"$ACFS_LIB_DIR"'"
+        source "'"$ACFS_LIB_DIR"'/newproj_screens.sh"
+        load_screens >/dev/null
+        render_success_screen() { echo "render"; }
+        open_in_claude() { echo "claude failed"; return 1; }
+        handle_success_input
+    ' <<< $'cq'
+
+    assert_success
+    [[ "$output" == *"claude failed"* ]]
+    [[ "$(printf "%s" "$output" | grep -c '^render$')" -ge 2 ]]
+}
+
+@test "execute_step init_br does not claim success when beads init is skipped" {
+    source_lib "newproj_screens"
+    load_screens
+
+    state_set "project_dir" "$TEST_DIR/no-br-project"
+    mkdir -p "$TEST_DIR/no-br-project"
+    render_progress_screen() { :; }
+    try_br_init() { return 2; }
+
+    execute_step init_br
+
+    [[ "${STEP_STATUS[init_br]}" == "pending" ]]
+}
+
+# ============================================================
+# State Management Integration Tests
+# ============================================================
+
+@test "screen navigation updates state correctly" {
+    source_lib "newproj_screens"
+    load_screens
+
+    CURRENT_SCREEN=""
+    SCREEN_HISTORY=()
+
+    push_screen "welcome"
+    [[ "$CURRENT_SCREEN" == "welcome" ]]
+
+    navigate_forward "project_name"
+    [[ "$CURRENT_SCREEN" == "project_name" ]]
+    [[ ${#SCREEN_HISTORY[@]} -eq 1 ]]
+
+    navigate_back
+    [[ "$CURRENT_SCREEN" == "welcome" ]]
+    [[ ${#SCREEN_HISTORY[@]} -eq 0 ]]
+}
+
+@test "state persists across screen changes" {
+    source_lib "newproj_screens"
+    load_screens
+
+    state_set "project_name" "my-test"
+    navigate_forward "directory"
+
+    [[ "$(state_get "project_name")" == "my-test" ]]
+}
+
+# ============================================================
+# Edge Cases
+# ============================================================
+
+@test "screens handle empty state gracefully" {
+    source_lib "newproj_screens"
+    load_screens
+
+    state_reset
+
+    # This should not crash
+    local output
+    output=$(render_project_name_screen "" 2>&1 | head -5)
+    [[ -n "$output" ]]
+}
+
+@test "get_screen_runner returns empty for unknown screen" {
+    source_lib "newproj_screens"
+
+    local runner
+    runner=$(get_screen_runner "nonexistent_screen")
+    [[ -z "$runner" ]]
+}

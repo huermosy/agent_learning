@@ -1,0 +1,4094 @@
+#!/usr/bin/env bash
+# ============================================================
+# ACFS Update - Update All Components
+# Updates system packages, agents, cloud CLIs, and stack tools
+# ============================================================
+
+set -euo pipefail
+
+# Prevent interactive prompts during apt operations
+export DEBIAN_FRONTEND=noninteractive
+
+ACFS_VERSION="${ACFS_VERSION:-0.1.0}"
+ACFS_REPO_OWNER="${ACFS_REPO_OWNER:-Dicklesworthstone}"
+ACFS_REPO_NAME="${ACFS_REPO_NAME:-agentic_coding_flywheel_setup}"
+ACFS_CHECKSUMS_REF="${ACFS_CHECKSUMS_REF:-main}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Discover ACFS_REPO_ROOT: prefer a real git repo over the tarball install dir.
+# On fleet machines, update.sh runs from ~/.acfs/scripts/lib/ (no .git) but
+# the authoritative source repo lives at /data/projects/agentic_coding_flywheel_setup.
+# Without this, self-update can't pull new code and deployed scripts go stale.
+_acfs_discover_repo_root() {
+    local script_root
+    script_root="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+    # If the script already lives inside a git repo, use it directly
+    if [[ -d "$script_root/.git" ]]; then
+        printf '%s\n' "$script_root"
+        return 0
+    fi
+
+    # Search well-known locations for a git-based ACFS checkout
+    local -a candidates=(
+        "/data/projects/agentic_coding_flywheel_setup"
+        "$HOME/agentic_coding_flywheel_setup"
+        "/dp/agentic_coding_flywheel_setup"
+    )
+    for candidate in "${candidates[@]}"; do
+        if [[ -d "$candidate/.git" ]] && [[ -f "$candidate/scripts/lib/update.sh" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    # Fallback: use script-relative root. If this is not a git checkout,
+    # self-update is skipped unless the caller explicitly opts into bootstrap.
+    printf '%s\n' "$script_root"
+}
+ACFS_REPO_ROOT="$(_acfs_discover_repo_root)"
+
+# Track if self-update already ran (prevents re-exec loops)
+ACFS_SELF_UPDATE_DONE="${ACFS_SELF_UPDATE_DONE:-false}"
+
+if [[ -f "$ACFS_REPO_ROOT/VERSION" ]]; then
+    ACFS_VERSION="$(cat "$ACFS_REPO_ROOT/VERSION" 2>/dev/null || echo "$ACFS_VERSION")"
+fi
+
+# Build display version: v0.7.0+a7598d0 (with short commit hash when available)
+_acfs_short_hash=""
+if command -v git &>/dev/null && [[ -d "$ACFS_REPO_ROOT/.git" ]]; then
+    _acfs_short_hash=$(git -C "$ACFS_REPO_ROOT" rev-parse --short HEAD 2>/dev/null) || true
+fi
+if [[ -n "$_acfs_short_hash" ]]; then
+    ACFS_VERSION_DISPLAY="v${ACFS_VERSION}+${_acfs_short_hash}"
+else
+    ACFS_VERSION_DISPLAY="v${ACFS_VERSION}"
+fi
+unset _acfs_short_hash
+
+# Colors - respect NO_COLOR standard (https://no-color.org/)
+# Related: bd-39ye
+if [[ -z "${NO_COLOR:-}" ]] && [[ -t 2 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    BOLD=''
+    DIM=''
+    NC=''
+fi
+
+# Counters
+SUCCESS_COUNT=0
+SKIP_COUNT=0
+FAIL_COUNT=0
+
+# Flags
+UPDATE_APT=true
+UPDATE_AGENTS=true
+UPDATE_CLOUD=true
+UPDATE_RUNTIME=true
+UPDATE_STACK=true
+UPDATE_SHELL=true
+UPDATE_SELF=true
+BOOTSTRAP_SELF_UPDATE=false
+FORCE_MODE=false
+DRY_RUN=false
+VERBOSE=false
+QUIET=false
+YES_MODE=false
+ABORT_ON_FAILURE=false
+REBOOT_REQUIRED=false
+
+# Logging
+UPDATE_LOG_DIR="${HOME}/.acfs/logs/updates"
+UPDATE_LOG_FILE=""
+
+# Version tracking
+declare -gA VERSION_BEFORE=()
+declare -gA VERSION_AFTER=()
+
+update_is_read_only_mode() {
+    [[ "${DRY_RUN:-false}" == "true" ]]
+}
+
+# ============================================================
+# Path Setup
+# ============================================================
+
+ensure_path() {
+    local dir
+    local to_add=()
+    local _primary_bin="${ACFS_BIN_DIR:-$HOME/.local/bin}"
+
+    for dir in \
+        "$_primary_bin" \
+        "$HOME/.local/bin" \
+        "$HOME/.acfs/bin" \
+        "$HOME/.bun/bin" \
+        "$HOME/.cargo/bin" \
+        "$HOME/go/bin" \
+        "$HOME/.atuin/bin"; do
+        [[ -d "$dir" ]] || continue
+        case ":$PATH:" in
+            *":$dir:"*) ;;
+            *) to_add+=("$dir") ;;
+        esac
+    done
+
+    if [[ ${#to_add[@]} -gt 0 ]]; then
+        local prefix
+        prefix=$(IFS=:; echo "${to_add[*]}")
+        export PATH="${prefix}:$PATH"
+    fi
+}
+
+update_source_stack_lib() {
+    if declare -f _stack_configure_agent_mail_service >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ -r "$SCRIPT_DIR/stack.sh" ]]; then
+        # shellcheck source=stack.sh
+        source "$SCRIPT_DIR/stack.sh"
+        return 0
+    fi
+
+    echo "Stack library not found at $SCRIPT_DIR/stack.sh" >&2
+    return 1
+}
+
+update_preferred_user_bin_dir() {
+    local state_file=""
+    local bin_dir=""
+
+    if [[ -n "${ACFS_BIN_DIR:-}" ]]; then
+        printf '%s\n' "${ACFS_BIN_DIR%/}"
+        return 0
+    fi
+
+    for state_file in \
+        "${ACFS_STATE_FILE:-}" \
+        "${ACFS_HOME:-}/state.json" \
+        "$HOME/.acfs/state.json" \
+        "/var/lib/acfs/state.json"; do
+        [[ -n "$state_file" && -f "$state_file" ]] || continue
+
+        if command -v jq &>/dev/null; then
+            bin_dir="$(jq -r '.bin_dir // empty' "$state_file" 2>/dev/null || true)"
+        else
+            bin_dir="$(sed -n 's/.*"bin_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)"
+        fi
+
+        if [[ -n "$bin_dir" ]] && [[ "$bin_dir" == /* ]] && [[ "$bin_dir" != "/" ]]; then
+            printf '%s\n' "${bin_dir%/}"
+            return 0
+        fi
+    done
+
+    printf '%s\n' "$HOME/.local/bin"
+}
+
+update_default_user_bin_dir() {
+    printf '%s\n' "$HOME/.local/bin"
+}
+
+update_tool_binary_path() {
+    local tool="$1"
+    local primary_bin=""
+    local user_bin
+    user_bin="$(update_default_user_bin_dir)"
+    primary_bin="$(update_preferred_user_bin_dir)"
+
+    case "$tool" in
+        atuin)
+            for candidate in \
+                "$primary_bin/atuin" \
+                "$user_bin/atuin" \
+                "$HOME/.atuin/bin/atuin"; do
+                [[ -x "$candidate" ]] || continue
+                printf '%s\n' "$candidate"
+                return 0
+            done
+            ;;
+        zoxide)
+            for candidate in \
+                "$primary_bin/zoxide" \
+                "$user_bin/zoxide"; do
+                [[ -x "$candidate" ]] || continue
+                printf '%s\n' "$candidate"
+                return 0
+            done
+            ;;
+        *)
+            ;;
+    esac
+
+    if cmd_exists "$tool"; then
+        command -v "$tool"
+        return 0
+    fi
+
+    return 1
+}
+
+update_tool_version_from_path() {
+    local tool="$1"
+    local binary_path="${2:-}"
+
+    [[ -n "$binary_path" ]] || {
+        printf 'unknown\n'
+        return 0
+    }
+
+    case "$tool" in
+        atuin|zoxide)
+            "$binary_path" --version 2>/dev/null | awk '{print $2}' || echo "unknown"
+            ;;
+        *)
+            "$binary_path" --version 2>/dev/null | head -1 || echo "unknown"
+            ;;
+    esac
+}
+
+update_has_nvm_node() {
+    compgen -G "$HOME/.nvm/versions/node/*/bin/node" >/dev/null 2>&1
+}
+
+update_nvm_node_bin_dir() {
+    local latest_bin=""
+    latest_bin="$(
+        compgen -G "$HOME/.nvm/versions/node/*/bin" | sort -V | tail -n 1
+    )"
+    [[ -n "$latest_bin" ]] || return 1
+    printf '%s\n' "$latest_bin"
+}
+
+update_ensure_gemini_patch_node() {
+    if update_has_nvm_node; then
+        return 0
+    fi
+
+    update_run_verified_installer nvm || return 1
+
+    export NVM_DIR="$HOME/.nvm"
+    if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
+        echo "nvm.sh not found at $NVM_DIR/nvm.sh" >&2
+        return 1
+    fi
+
+    # shellcheck disable=SC1090
+    . "$NVM_DIR/nvm.sh"
+    nvm install node
+    nvm alias default node
+
+    update_has_nvm_node
+}
+
+is_expected_acfs_origin_url() {
+    local url="$1"
+    local normalized="$url"
+    normalized="${normalized%/}"
+
+    case "$normalized" in
+        https://github.com/*)
+            normalized="${normalized#https://github.com/}"
+            ;;
+        git@github.com:*)
+            normalized="${normalized#git@github.com:}"
+            ;;
+        ssh://git@github.com/*)
+            normalized="${normalized#ssh://git@github.com/}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    normalized="${normalized%.git}"
+    normalized="${normalized,,}"
+
+    local expected="${ACFS_REPO_OWNER}/${ACFS_REPO_NAME}"
+    expected="${expected,,}"
+    [[ "$normalized" == "$expected" ]]
+}
+
+# ============================================================
+# Logging Infrastructure
+# ============================================================
+
+init_logging() {
+    if update_is_read_only_mode; then
+        UPDATE_LOG_FILE=""
+        return 0
+    fi
+
+    mkdir -p "$UPDATE_LOG_DIR"
+    UPDATE_LOG_FILE="$UPDATE_LOG_DIR/$(date '+%Y-%m-%d-%H%M%S').log"
+
+    # Write log header
+    {
+        echo "==============================================="
+        echo "ACFS Update Log"
+        echo "Started: $(date -Iseconds)"
+        echo "User: $(whoami)"
+        echo "Version: $ACFS_VERSION_DISPLAY"
+        echo "==============================================="
+        echo ""
+    } >> "$UPDATE_LOG_FILE"
+}
+
+log_to_file() {
+    local msg="$1"
+    if [[ -n "$UPDATE_LOG_FILE" ]]; then
+        echo "[$(date '+%H:%M:%S')] $msg" >> "$UPDATE_LOG_FILE"
+    fi
+}
+
+update_ensure_jq_available() {
+    if cmd_exists jq; then
+        return 0
+    fi
+
+    if update_is_read_only_mode; then
+        echo -e "${YELLOW}Dry-run: jq is missing; skipping jq installation and continuing with limited preview${NC}" >&2
+        return 0
+    fi
+
+    echo -e "${YELLOW}Installing jq (required for update operations)...${NC}" >&2
+    if [[ $EUID -eq 0 ]]; then
+        apt-get update -qq 2>/dev/null && apt-get install -y -qq jq 2>/dev/null || true
+    elif cmd_exists sudo; then
+        sudo apt-get update -qq 2>/dev/null && sudo apt-get install -y -qq jq 2>/dev/null || true
+    fi
+
+    if ! cmd_exists jq; then
+        echo -e "${YELLOW}Warning: jq could not be installed; some operations may be limited${NC}" >&2
+    fi
+}
+
+# ============================================================
+# Version Detection
+# ============================================================
+
+get_version() {
+    local tool="$1"
+    local version=""
+
+    case "$tool" in
+        bun)
+            version=$("$HOME/.bun/bin/bun" --version 2>/dev/null || echo "unknown")
+            ;;
+        rust)
+            version=$("$HOME/.cargo/bin/rustc" --version 2>/dev/null | awk '{print $2}' || echo "unknown")
+            ;;
+        uv)
+            version=$("${ACFS_BIN_DIR:-$HOME/.local/bin}/uv" --version 2>/dev/null | awk '{print $2}' || echo "unknown")
+            ;;
+        claude)
+            version=$(claude --version 2>/dev/null | head -1 || echo "unknown")
+            ;;
+        codex)
+            version=$(codex --version 2>/dev/null || echo "unknown")
+            ;;
+        gemini)
+            version=$(gemini --version 2>/dev/null || echo "unknown")
+            ;;
+        wrangler)
+            version=$(wrangler --version 2>/dev/null || echo "unknown")
+            ;;
+        supabase)
+            version=$(supabase --version 2>/dev/null || echo "unknown")
+            ;;
+        vercel)
+            version=$(vercel --version 2>/dev/null || echo "unknown")
+            ;;
+        pcr)
+            local pcr_bin="${ACFS_BIN_DIR:-$HOME/.local/bin}/claude-post-compact-reminder"
+            if [[ -x "$pcr_bin" ]]; then
+                version=$("$pcr_bin" --version 2>/dev/null | head -1 || echo "unknown")
+            elif cmd_exists claude-post-compact-reminder; then
+                version=$(claude-post-compact-reminder --version 2>/dev/null | head -1 || echo "unknown")
+            else
+                version="unknown"
+            fi
+            ;;
+        ntm|ubs|bv|cass|cm|caam|slb|ru|dcg|apr|pt|xf|jfp|ms|br|rch|giil|csctf|srps|tru|rano|mdwb|s2p|brenner|fsfs|sbh|casr|dsr|asb)
+            version=$("$tool" --version 2>/dev/null | head -1 || echo "unknown")
+            ;;
+        sg|lsd|dust|tldr)
+            version=$("$tool" --version 2>/dev/null | head -1 || echo "unknown")
+            ;;
+        atuin)
+            version=$(update_tool_version_from_path "atuin" "$(update_tool_binary_path "atuin" 2>/dev/null || true)")
+            ;;
+        zoxide)
+            version=$(update_tool_version_from_path "zoxide" "$(update_tool_binary_path "zoxide" 2>/dev/null || true)")
+            ;;
+        omz)
+            # OMZ version from .oh-my-zsh git tag or commit
+            local omz_dir="${ZSH:-$HOME/.oh-my-zsh}"
+            if [[ -d "$omz_dir/.git" ]]; then
+                version=$(git -C "$omz_dir" describe --tags --abbrev=0 2>/dev/null || \
+                          git -C "$omz_dir" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+            else
+                version="unknown"
+            fi
+            ;;
+        p10k)
+            # P10K version from git tag or commit
+            local p10k_dir="${ZSH_CUSTOM:-${ZSH:-$HOME/.oh-my-zsh}/custom}/themes/powerlevel10k"
+            if [[ -d "$p10k_dir/.git" ]]; then
+                version=$(git -C "$p10k_dir" describe --tags --abbrev=0 2>/dev/null || \
+                          git -C "$p10k_dir" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+            else
+                version="unknown"
+            fi
+            ;;
+        *)
+            version="unknown"
+            ;;
+    esac
+
+    echo "$version"
+}
+
+capture_version_before() {
+    local tool="$1"
+    VERSION_BEFORE["$tool"]=$(get_version "$tool")
+    log_to_file "Version before [$tool]: ${VERSION_BEFORE[$tool]}"
+}
+
+capture_version_after() {
+    local tool="$1"
+    VERSION_AFTER["$tool"]=$(get_version "$tool")
+    log_to_file "Version after [$tool]: ${VERSION_AFTER[$tool]}"
+
+    local before="${VERSION_BEFORE[$tool]:-unknown}"
+    local after="${VERSION_AFTER[$tool]}"
+
+    if [[ "$before" != "$after" ]]; then
+        log_to_file "Updated [$tool]: $before -> $after"
+        return 0
+    fi
+    return 1
+}
+
+get_file_mtime() {
+    local path="$1"
+
+    if [[ ! -e "$path" ]]; then
+        return 1
+    fi
+
+    if stat -c %Y "$path" >/dev/null 2>&1; then
+        stat -c %Y "$path"
+        return 0
+    fi
+
+    if stat -f %m "$path" >/dev/null 2>&1; then
+        stat -f %m "$path"
+        return 0
+    fi
+
+    return 1
+}
+
+# ============================================================
+# Helper Functions
+# ============================================================
+
+log_section() {
+    log_to_file "=== $1 ==="
+    if [[ "$QUIET" != "true" ]]; then
+        echo ""
+        echo -e "${BOLD}${CYAN}$1${NC}"
+        echo "------------------------------------------------------------"
+    fi
+}
+
+log_item() {
+    local status="$1"
+    local msg="$2"
+    local details="${3:-}"
+
+    log_to_file "[$status] $msg${details:+ - $details}"
+
+    case "$status" in
+        ok)
+            [[ "$QUIET" != "true" ]] && printf "  ${GREEN}[ok]${NC} %s\n" "$msg"
+            [[ -n "$details" && "$VERBOSE" == "true" && "$QUIET" != "true" ]] && printf "       ${DIM}%s${NC}\n" "$details"
+            ((SUCCESS_COUNT += 1))
+            ;;
+        skip)
+            [[ "$QUIET" != "true" ]] && printf "  ${DIM}[skip]${NC} %s\n" "$msg"
+            [[ -n "$details" && "$QUIET" != "true" ]] && printf "       ${DIM}%s${NC}\n" "$details"
+            ((SKIP_COUNT += 1))
+            ;;
+        fail)
+            # Always show failures even in quiet mode
+            printf "  ${RED}[fail]${NC} %s\n" "$msg"
+            [[ -n "$details" ]] && printf "       ${DIM}%s${NC}\n" "$details"
+            ((FAIL_COUNT += 1))
+            ;;
+        run)
+            [[ "$QUIET" != "true" ]] && printf "  ${YELLOW}[...]${NC} %s\n" "$msg"
+            ;;
+        warn)
+            [[ "$QUIET" != "true" ]] && printf "  ${YELLOW}[warn]${NC} %s\n" "$msg"
+            [[ -n "$details" && "$QUIET" != "true" ]] && printf "       ${DIM}%s${NC}\n" "$details"
+            ;;
+        wait)
+            [[ "$QUIET" != "true" ]] && printf "  ${YELLOW}[wait]${NC} %s\n" "$msg"
+            [[ -n "$details" && "$QUIET" != "true" ]] && printf "       ${DIM}%s${NC}\n" "$details"
+            ;;
+        fix)
+            [[ "$QUIET" != "true" ]] && printf "  ${YELLOW}[fix]${NC} %s\n" "$msg"
+            [[ -n "$details" && "$QUIET" != "true" ]] && printf "       ${DIM}%s${NC}\n" "$details"
+            ((SUCCESS_COUNT += 1))
+            ;;
+        info)
+            [[ "$QUIET" != "true" ]] && printf "  ${CYAN}[info]${NC} %s\n" "$msg"
+            [[ -n "$details" && "$QUIET" != "true" ]] && printf "       ${DIM}%s${NC}\n" "$details"
+            ;;
+    esac
+
+    return 0
+}
+
+update_finish_cmd_ok() {
+    local desc="$1"
+    local details="${2:-}"
+
+    if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+        printf "\033[1A\033[2K  ${GREEN}[ok]${NC} %s\n" "$desc"
+    elif [[ "$QUIET" != "true" ]]; then
+        printf "  ${GREEN}[ok]${NC} %s\n" "$desc"
+    fi
+    [[ -n "$details" && "$QUIET" != "true" ]] && printf "       ${DIM}%s${NC}\n" "$details"
+
+    log_to_file "Success: $desc${details:+ - $details}"
+    ((SUCCESS_COUNT += 1))
+}
+
+update_finish_cmd_fail() {
+    local desc="$1"
+    local details="${2:-}"
+
+    if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+        printf "\033[1A\033[2K  ${RED}[fail]${NC} %s\n" "$desc"
+    else
+        printf "  ${RED}[fail]${NC} %s\n" "$desc"
+    fi
+    [[ -n "$details" ]] && printf "       ${DIM}%s${NC}\n" "$details"
+
+    log_to_file "Failed: $desc${details:+ - $details}"
+    ((FAIL_COUNT += 1))
+
+    if [[ "$ABORT_ON_FAILURE" == "true" ]]; then
+        echo -e "${RED}Aborting due to failure (--abort-on-failure)${NC}"
+        log_to_file "ABORT: Stopping due to --abort-on-failure"
+        exit 1
+    fi
+}
+
+update_run_command_capture_with_retry() {
+    local desc="$1"
+    shift
+
+    local max_attempts=3
+    local attempt=1
+    local exit_code=0
+    local output=""
+    local cmd_display=""
+    cmd_display=$(printf '%q ' "$@")
+
+    log_to_file "Running (captured with retry): $cmd_display"
+
+    while [[ $attempt -le $max_attempts ]]; do
+        exit_code=0
+        output=$("$@" 2>&1) || exit_code=$?
+        [[ -n "$output" ]] && log_to_file "Output: $output"
+        [[ "$VERBOSE" == "true" && "$QUIET" != "true" && -n "$output" ]] && printf "%s\n" "$output"
+
+        if [[ $exit_code -eq 0 ]]; then
+            return 0
+        fi
+
+        if update_is_transient_failure_output "$output" && [[ $attempt -lt $max_attempts ]]; then
+            local sleep_secs
+            sleep_secs="$(update_retry_sleep_seconds "$attempt")"
+            log_to_file "Transient error detected for $desc, retrying in ${sleep_secs}s (attempt $attempt/$max_attempts)"
+            sleep "$sleep_secs"
+            ((attempt += 1))
+            continue
+        fi
+
+        break
+    done
+
+    return "$exit_code"
+}
+
+update_shell_tool_state_improved() {
+    local before_path="${1:-}"
+    local before_version="${2:-unknown}"
+    local after_path="${3:-}"
+    local after_version="${4:-unknown}"
+
+    [[ -n "$after_path" && -x "$after_path" ]] || return 1
+    [[ -n "$after_version" && "$after_version" != "unknown" ]] || return 1
+
+    [[ -z "$before_path" || "$after_path" != "$before_path" || "$after_version" != "$before_version" ]]
+}
+
+update_repair_atuin_install() {
+    local preferred_src="$HOME/.atuin/bin/atuin"
+    local primary_dir=""
+    local user_bin
+    primary_dir="$(update_preferred_user_bin_dir)"
+    user_bin="$(update_default_user_bin_dir)"
+    local -a bin_dirs=("$primary_dir")
+    local dir=""
+
+    if [[ "$user_bin" != "$primary_dir" ]]; then
+        bin_dirs+=("$user_bin")
+    fi
+
+    if [[ -x "$preferred_src" ]]; then
+        for dir in "${bin_dirs[@]}"; do
+            [[ -n "$dir" ]] || continue
+            mkdir -p "$dir" 2>/dev/null || true
+            if ln -sf "$preferred_src" "$dir/atuin" 2>/dev/null; then
+                log_to_file "Atuin symlink normalized: $dir/atuin -> $preferred_src"
+            fi
+        done
+    fi
+
+    hash -r 2>/dev/null || true
+
+    local resolved_bin=""
+    resolved_bin="$(update_tool_binary_path "atuin" 2>/dev/null || true)"
+    [[ -n "$resolved_bin" && -x "$resolved_bin" ]] || return 1
+    "$resolved_bin" --version >/dev/null 2>&1
+}
+
+update_repair_zoxide_install() {
+    hash -r 2>/dev/null || true
+
+    local resolved_bin=""
+    resolved_bin="$(update_tool_binary_path "zoxide" 2>/dev/null || true)"
+    [[ -n "$resolved_bin" && -x "$resolved_bin" ]] || return 1
+    "$resolved_bin" --version >/dev/null 2>&1
+}
+
+update_run_verified_installer_with_shell_repair() {
+    local desc="$1"
+    local tool="$2"
+    local repair_fn="$3"
+    shift 3
+
+    local before_path=""
+    local before_version="unknown"
+    local after_path=""
+    local after_version="unknown"
+    local exit_code=0
+
+    before_path="$(update_tool_binary_path "$tool" 2>/dev/null || true)"
+    before_version="$(get_version "$tool")"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_item "skip" "$desc" "dry-run: verified installer + repair"
+        return 0
+    fi
+
+    log_item "run" "$desc"
+    update_run_command_capture_with_retry "$desc" update_run_verified_installer "$tool" "$@" || exit_code=$?
+
+    "$repair_fn" >/dev/null 2>&1 || true
+    after_path="$(update_tool_binary_path "$tool" 2>/dev/null || true)"
+    after_version="$(get_version "$tool")"
+
+    if [[ $exit_code -eq 0 ]]; then
+        if [[ -n "$after_path" && -x "$after_path" && "$after_version" != "unknown" ]]; then
+            update_finish_cmd_ok "$desc"
+            return 0
+        fi
+        update_finish_cmd_fail "$desc" "installer completed but binary verification failed"
+        return 1
+    fi
+
+    if update_shell_tool_state_improved "$before_path" "$before_version" "$after_path" "$after_version"; then
+        update_finish_cmd_ok "$desc" "verified repaired binary at ${after_path} (${after_version})"
+        return 0
+    fi
+
+    update_finish_cmd_fail "$desc" "installer exited ${exit_code}"
+    return 1
+}
+
+run_cmd() {
+    local desc="$1"
+    shift
+    local cmd_display=""
+    cmd_display=$(printf '%q ' "$@")
+
+    log_to_file "Running: $cmd_display"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_item "skip" "$desc" "dry-run: $cmd_display"
+        return 0
+    fi
+
+    log_item "run" "$desc"
+
+    local exit_code=0
+
+    # In verbose mode, stream command output to the console AND log file.
+    # In non-verbose mode, capture output for logging without flooding the terminal.
+    if [[ "$VERBOSE" == "true" ]]; then
+        if [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+            # Separate commands in the log for readability.
+            {
+                echo ""
+                echo "----- COMMAND: $cmd_display"
+            } >> "$UPDATE_LOG_FILE"
+        fi
+
+        if [[ "$QUIET" != "true" ]] && [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+            if "$@" 2>&1 | tee -a "$UPDATE_LOG_FILE"; then
+                exit_code=0
+            else
+                exit_code=${PIPESTATUS[0]}
+            fi
+        elif [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+            if "$@" >> "$UPDATE_LOG_FILE" 2>&1; then
+                exit_code=0
+            else
+                exit_code=$?
+            fi
+        else
+            # Should not happen (init_logging sets UPDATE_LOG_FILE), but keep a safe fallback.
+            if [[ "$QUIET" != "true" ]]; then
+                "$@" || exit_code=$?
+            else
+                "$@" >/dev/null 2>&1 || exit_code=$?
+            fi
+        fi
+    else
+        local output=""
+        output=$("$@" 2>&1) || exit_code=$?
+        [[ -n "$output" ]] && log_to_file "Output: $output"
+    fi
+
+    if [[ $exit_code -eq 0 ]]; then
+        # Move cursor up and overwrite (only in non-verbose, non-quiet mode)
+        if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+            printf "\033[1A\033[2K  ${GREEN}[ok]${NC} %s\n" "$desc"
+        elif [[ "$QUIET" != "true" ]]; then
+            printf "  ${GREEN}[ok]${NC} %s\n" "$desc"
+        fi
+        log_to_file "Success: $desc"
+        ((SUCCESS_COUNT += 1))
+        return 0
+    else
+        if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+            printf "\033[1A\033[2K  ${RED}[fail]${NC} %s\n" "$desc"
+        else
+            printf "  ${RED}[fail]${NC} %s\n" "$desc"
+        fi
+        log_to_file "Failed: $desc (exit code: $exit_code)"
+        ((FAIL_COUNT += 1))
+
+        # Handle abort-on-failure
+        if [[ "$ABORT_ON_FAILURE" == "true" ]]; then
+            echo -e "${RED}Aborting due to failure (--abort-on-failure)${NC}"
+            log_to_file "ABORT: Stopping due to --abort-on-failure"
+            exit 1
+        fi
+        return 0
+    fi
+}
+
+# Run bun command with retry logic for transient failures
+# Usage: run_cmd_bun_with_retry "description" bun_bin install -g --trust pkg@latest
+run_cmd_bun_with_retry() {
+    local desc="$1"
+    shift
+    local max_attempts=3
+    local attempt=1
+    local exit_code=0
+    local output=""
+    local cmd_display=""
+    cmd_display=$(printf '%q ' "$@")
+
+    log_to_file "Running (with retry): $cmd_display"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_item "skip" "$desc" "dry-run: $cmd_display"
+        return 0
+    fi
+
+    log_item "run" "$desc"
+
+    while [[ $attempt -le $max_attempts ]]; do
+        exit_code=0
+        output=""
+
+        if [[ "$VERBOSE" == "true" ]]; then
+            if [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+                # Separate commands in the log for readability.
+                {
+                    echo ""
+                    echo "----- COMMAND (attempt $attempt/$max_attempts): $cmd_display"
+                } >> "$UPDATE_LOG_FILE"
+            fi
+
+            if [[ "$QUIET" != "true" ]] && [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+                output=$("$@" 2>&1 | tee -a "$UPDATE_LOG_FILE") || exit_code=${PIPESTATUS[0]}
+            elif [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+                output=$("$@" 2>&1) || exit_code=$?
+                [[ -n "$output" ]] && echo "$output" >> "$UPDATE_LOG_FILE"
+            else
+                output=$("$@" 2>&1) || exit_code=$?
+            fi
+        else
+            output=$("$@" 2>&1) || exit_code=$?
+            [[ -n "$output" ]] && log_to_file "Output: $output"
+        fi
+
+        if [[ $exit_code -eq 0 ]]; then
+            # Move cursor up and overwrite (only in non-verbose, non-quiet mode)
+            if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+                printf "\033[1A\033[2K  ${GREEN}[ok]${NC} %s\n" "$desc"
+            elif [[ "$QUIET" != "true" ]]; then
+                printf "  ${GREEN}[ok]${NC} %s\n" "$desc"
+            fi
+            log_to_file "Success: $desc"
+            ((SUCCESS_COUNT += 1))
+            return 0
+        fi
+
+        # Check for transient errors that warrant a retry
+        local is_transient=false
+        if update_is_transient_failure_output "$output"; then
+            is_transient=true
+        fi
+
+        if [[ "$is_transient" == "true" ]] && [[ $attempt -lt $max_attempts ]]; then
+            local sleep_secs=$((attempt * 2))
+            log_to_file "Transient error detected, retrying in ${sleep_secs}s (attempt $attempt/$max_attempts)"
+
+            if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+                printf "\033[1A\033[2K  ${YELLOW}[retry]${NC} %s (attempt %d/%d)\n" "$desc" "$attempt" "$max_attempts"
+            elif [[ "$QUIET" != "true" ]]; then
+                printf "  ${YELLOW}[retry]${NC} %s (attempt %d/%d)\n" "$desc" "$attempt" "$max_attempts"
+            fi
+
+            # Clear bun's tmp cache to avoid stale locks
+            local bun_cache_tmp="${HOME}/.bun/install/cache/.tmp"
+            if [[ -d "$bun_cache_tmp" ]]; then
+                rm -rf "$bun_cache_tmp" 2>/dev/null || true
+                log_to_file "Cleared bun cache .tmp directory"
+            fi
+
+            sleep "$sleep_secs"
+            ((attempt += 1))
+
+            # Re-display "running" status for the retry
+            if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+                log_item "run" "$desc"
+            fi
+        else
+            break
+        fi
+    done
+
+    # Final failure
+    if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+        printf "\033[1A\033[2K  ${RED}[fail]${NC} %s\n" "$desc"
+    else
+        printf "  ${RED}[fail]${NC} %s\n" "$desc"
+    fi
+    log_to_file "Failed: $desc (exit code: $exit_code after $attempt attempts)"
+    ((FAIL_COUNT += 1))
+
+    if [[ "$ABORT_ON_FAILURE" == "true" ]]; then
+        echo -e "${RED}Aborting due to failure (--abort-on-failure)${NC}"
+        log_to_file "ABORT: Stopping due to --abort-on-failure"
+        exit 1
+    fi
+    return 0
+}
+
+update_is_transient_failure_output() {
+    local output="${1:-}"
+
+    [[ -n "$output" ]] || return 1
+
+    printf '%s\n' "$output" | grep -qiE \
+        'failed to map segment|ENOENT|EACCES|EAGAIN|Connection reset|timed out|rate limit|too many requests|429|503|502|500|TLS|temporary failure|connection refused|reset by peer|network is unreachable|could not resolve host|curl:|wget:|failed to download|download.*failed'
+}
+
+update_retry_sleep_seconds() {
+    local attempt="${1:-1}"
+
+    if [[ -n "${ACFS_UPDATE_RETRY_SLEEP_SECONDS:-}" ]]; then
+        printf '%s\n' "$ACFS_UPDATE_RETRY_SLEEP_SECONDS"
+        return 0
+    fi
+
+    printf '%s\n' "$((attempt * 2))"
+}
+
+_run_cmd_with_retry_internal() {
+    local desc="$1"
+    local failure_mode="$2"
+    shift 2
+
+    local max_attempts="${ACFS_UPDATE_RETRY_MAX_ATTEMPTS:-3}"
+    local attempt=1
+    local exit_code=0
+    local output=""
+    local cmd_display=""
+    cmd_display=$(printf '%q ' "$@")
+
+    log_to_file "Running (with retry): $cmd_display"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_item "skip" "$desc" "dry-run: $cmd_display"
+        return 0
+    fi
+
+    log_item "run" "$desc"
+
+    while [[ $attempt -le $max_attempts ]]; do
+        exit_code=0
+        output=""
+
+        if [[ "$VERBOSE" == "true" ]]; then
+            if [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+                {
+                    echo ""
+                    echo "----- COMMAND (attempt $attempt/$max_attempts): $cmd_display"
+                } >> "$UPDATE_LOG_FILE"
+            fi
+
+            if [[ "$QUIET" != "true" ]] && [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+                output=$("$@" 2>&1 | tee -a "$UPDATE_LOG_FILE") || exit_code=${PIPESTATUS[0]}
+            elif [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+                output=$("$@" 2>&1) || exit_code=$?
+                [[ -n "$output" ]] && echo "$output" >> "$UPDATE_LOG_FILE"
+            else
+                output=$("$@" 2>&1) || exit_code=$?
+            fi
+        else
+            output=$("$@" 2>&1) || exit_code=$?
+            [[ -n "$output" ]] && log_to_file "Output: $output"
+        fi
+
+        if [[ $exit_code -eq 0 ]]; then
+            if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+                printf "\033[1A\033[2K  ${GREEN}[ok]${NC} %s\n" "$desc"
+            elif [[ "$QUIET" != "true" ]]; then
+                printf "  ${GREEN}[ok]${NC} %s\n" "$desc"
+            fi
+            log_to_file "Success: $desc"
+            ((SUCCESS_COUNT += 1))
+            return 0
+        fi
+
+        if update_is_transient_failure_output "$output" && [[ $attempt -lt $max_attempts ]]; then
+            local sleep_secs
+            sleep_secs="$(update_retry_sleep_seconds "$attempt")"
+            log_to_file "Transient error detected, retrying in ${sleep_secs}s (attempt $attempt/$max_attempts)"
+
+            if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+                printf "\033[1A\033[2K  ${YELLOW}[retry]${NC} %s (attempt %d/%d)\n" "$desc" "$attempt" "$max_attempts"
+            elif [[ "$QUIET" != "true" ]]; then
+                printf "  ${YELLOW}[retry]${NC} %s (attempt %d/%d)\n" "$desc" "$attempt" "$max_attempts"
+            fi
+
+            sleep "$sleep_secs"
+            ((attempt += 1))
+
+            if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+                log_item "run" "$desc"
+            fi
+            continue
+        fi
+
+        break
+    done
+
+    if [[ "$failure_mode" == "fallback" ]]; then
+        if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+            printf "\033[1A\033[2K  ${YELLOW}[retry]${NC} %s\n" "$desc"
+        elif [[ "$QUIET" != "true" ]]; then
+            printf "  ${YELLOW}[retry]${NC} %s\n" "$desc"
+        fi
+        log_to_file "Failed: $desc (exit code: $exit_code after $attempt attempts), will try fallback"
+        return "$exit_code"
+    fi
+
+    if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+        printf "\033[1A\033[2K  ${RED}[fail]${NC} %s\n" "$desc"
+    else
+        printf "  ${RED}[fail]${NC} %s\n" "$desc"
+    fi
+    log_to_file "Failed: $desc (exit code: $exit_code after $attempt attempts)"
+    ((FAIL_COUNT += 1))
+
+    if [[ "$ABORT_ON_FAILURE" == "true" ]]; then
+        echo -e "${RED}Aborting due to failure (--abort-on-failure)${NC}"
+        log_to_file "ABORT: Stopping due to --abort-on-failure"
+        exit 1
+    fi
+
+    return "$exit_code"
+}
+
+run_cmd_with_retry_status() {
+    local desc="$1"
+    shift
+    _run_cmd_with_retry_internal "$desc" "fail" "$@"
+}
+
+run_cmd_attempt_with_retry() {
+    local desc="$1"
+    shift
+    _run_cmd_with_retry_internal "$desc" "fallback" "$@"
+}
+
+# Check if command exists
+cmd_exists() {
+    command -v "$1" &>/dev/null
+}
+
+# Get sudo (empty if already root)
+get_sudo() {
+    if [[ $EUID -eq 0 ]]; then
+        echo ""
+    else
+        echo "sudo"
+    fi
+}
+
+run_cmd_sudo() {
+    local desc="$1"
+    shift
+
+    local sudo_cmd
+    sudo_cmd=$(get_sudo)
+    if [[ -n "$sudo_cmd" ]]; then
+        run_cmd "$desc" "$sudo_cmd" "$@"
+        return 0
+    fi
+    run_cmd "$desc" "$@"
+}
+
+update_current_user() {
+    id -un 2>/dev/null || whoami 2>/dev/null || true
+}
+
+update_target_user() {
+    if [[ -n "${TARGET_USER:-}" ]]; then
+        printf '%s\n' "$TARGET_USER"
+        return 0
+    fi
+
+    local current_user=""
+    current_user="$(update_current_user)"
+    if [[ -n "$current_user" ]]; then
+        printf '%s\n' "$current_user"
+        return 0
+    fi
+
+    printf '%s\n' "ubuntu"
+}
+
+update_target_home() {
+    local target_user="${1:-}"
+    local passwd_entry=""
+    local current_user=""
+
+    if [[ -n "${TARGET_HOME:-}" ]] && [[ "${TARGET_HOME}" == /* ]] && [[ "${TARGET_HOME}" != "/" ]]; then
+        printf '%s\n' "${TARGET_HOME%/}"
+        return 0
+    fi
+
+    passwd_entry="$(getent passwd "$target_user" 2>/dev/null || true)"
+    if [[ -n "$passwd_entry" ]]; then
+        passwd_entry="$(printf '%s\n' "$passwd_entry" | cut -d: -f6)"
+        if [[ -n "$passwd_entry" ]] && [[ "$passwd_entry" == /* ]] && [[ "$passwd_entry" != "/" ]]; then
+            printf '%s\n' "${passwd_entry%/}"
+            return 0
+        fi
+    fi
+
+    if [[ "$target_user" == "root" ]]; then
+        printf '%s\n' "/root"
+        return 0
+    fi
+
+    current_user="$(update_current_user)"
+    if [[ "$target_user" == "$current_user" ]] && [[ -n "${HOME:-}" ]] && [[ "${HOME}" == /* ]] && [[ "${HOME}" != "/" ]]; then
+        printf '%s\n' "${HOME%/}"
+        return 0
+    fi
+
+    if [[ "$target_user" =~ ^[a-z_][a-z0-9._-]*$ ]]; then
+        printf '/home/%s\n' "$target_user"
+        return 0
+    fi
+
+    return 1
+}
+
+update_target_path() {
+    local target_home="$1"
+    local target_bin="${ACFS_BIN_DIR:-$target_home/.local/bin}"
+    local current_path="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+
+    printf '%s\n' "$target_bin:$target_home/.local/bin:$target_home/.acfs/bin:$target_home/.bun/bin:$target_home/.cargo/bin:$target_home/.atuin/bin:$target_home/go/bin:$current_path"
+}
+
+update_run_in_target_context() {
+    local bash_env_assignment="${1:-}"
+    shift
+
+    local target_user=""
+    local current_user=""
+    local target_home=""
+    local target_path=""
+    target_user="$(update_target_user)"
+    current_user="$(update_current_user)"
+    target_home="$(update_target_home "$target_user")"
+    target_path="$(update_target_path "$target_home")"
+
+    local -a env_args=("UV_NO_CONFIG=1" "HOME=$target_home" "PATH=$target_path")
+    [[ -n "$target_user" ]] && env_args+=("TARGET_USER=$target_user")
+    [[ -n "$target_home" ]] && env_args+=("TARGET_HOME=$target_home")
+    [[ -n "${ACFS_HOME:-}" ]] && env_args+=("ACFS_HOME=$ACFS_HOME")
+    [[ -n "$bash_env_assignment" ]] && env_args+=("$bash_env_assignment")
+
+    if [[ "$current_user" == "$target_user" ]]; then
+        if [[ -d "$target_home" ]]; then
+            (
+                cd "$target_home" || exit 1
+                env "${env_args[@]}" "$@"
+            )
+            return $?
+        fi
+
+        env "${env_args[@]}" "$@"
+        return $?
+    fi
+
+    if command -v sudo &>/dev/null; then
+        sudo -n -u "$target_user" env "${env_args[@]}" sh -c 'cd "$HOME" || exit 1; exec "$@"' _ "$@"
+        return $?
+    fi
+
+    if command -v runuser &>/dev/null; then
+        runuser -u "$target_user" -- env "${env_args[@]}" sh -c 'cd "$HOME" || exit 1; exec "$@"' _ "$@"
+        return $?
+    fi
+
+    echo "Cannot switch to target user '$target_user' (sudo/runuser unavailable)" >&2
+    return 1
+}
+
+# ============================================================
+# Migration Cleanup
+# ============================================================
+
+# Clean up legacy git_safety_guard artifacts from pre-DCG installations
+# This runs on every update to ensure stale files are removed
+cleanup_legacy_git_safety_guard() {
+    if update_is_read_only_mode; then
+        local would_clean=false
+        local hooks_dir=""
+        local legacy_file=""
+
+        for hooks_dir in "$HOME/.acfs/claude/hooks" "$HOME/.claude/hooks"; do
+            for legacy_file in git_safety_guard.py git_safety_guard.sh; do
+                if [[ -f "$hooks_dir/$legacy_file" ]]; then
+                    would_clean=true
+                fi
+            done
+        done
+
+        if [[ -f "$HOME/.claude/settings.json" ]] && grep -q "git_safety_guard" "$HOME/.claude/settings.json" 2>/dev/null; then
+            would_clean=true
+        fi
+
+        if [[ "$would_clean" == "true" ]]; then
+            log_item "skip" "legacy cleanup" "dry-run: would remove git_safety_guard artifacts"
+        fi
+        return 0
+    fi
+
+    local cleaned=false
+    local hooks_dirs=(
+        "$HOME/.acfs/claude/hooks"
+        "$HOME/.claude/hooks"
+    )
+    local legacy_files=(
+        "git_safety_guard.py"
+        "git_safety_guard.sh"
+    )
+
+    # Remove legacy hook files
+    for dir in "${hooks_dirs[@]}"; do
+        for file in "${legacy_files[@]}"; do
+            if [[ -f "$dir/$file" ]]; then
+                rm -f "$dir/$file" 2>/dev/null && cleaned=true
+                log_to_file "Removed legacy file: $dir/$file"
+            fi
+        done
+        # Remove empty hooks directory
+        if [[ -d "$dir" ]] && [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
+            rmdir "$dir" 2>/dev/null && cleaned=true
+            log_to_file "Removed empty directory: $dir"
+        fi
+    done
+
+    # Clean parent directories if empty
+    for parent in "$HOME/.acfs/claude" "$HOME/.claude"; do
+        if [[ -d "$parent" ]] && [[ -z "$(ls -A "$parent" 2>/dev/null)" ]]; then
+            rmdir "$parent" 2>/dev/null || true
+            log_to_file "Removed empty directory: $parent"
+        fi
+    done
+
+    # Clean git_safety_guard from Claude settings.json if present
+    local settings_file="$HOME/.claude/settings.json"
+    if [[ -f "$settings_file" ]] && command -v jq &>/dev/null; then
+        if jq -e '.hooks // empty' "$settings_file" &>/dev/null; then
+            # Check if git_safety_guard is referenced in hooks
+            if grep -q "git_safety_guard" "$settings_file" 2>/dev/null; then
+                local tmp_settings
+                tmp_settings=$(mktemp "${TMPDIR:-/tmp}/acfs_settings.XXXXXX" 2>/dev/null) || tmp_settings=""
+                if [[ -n "$tmp_settings" ]]; then
+                    # Remove any hook entries containing git_safety_guard
+                    if jq 'walk(if type == "object" and .hooks then .hooks |= map(select(. | tostring | contains("git_safety_guard") | not)) else . end)' "$settings_file" > "$tmp_settings" 2>/dev/null; then
+                        mv "$tmp_settings" "$settings_file" && cleaned=true
+                        log_to_file "Cleaned git_safety_guard references from $settings_file"
+                    else
+                        rm -f "$tmp_settings"
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    if [[ "$cleaned" == "true" ]]; then
+        log_item "ok" "legacy cleanup" "removed git_safety_guard artifacts"
+    fi
+}
+
+cleanup_legacy_bv_alias() {
+    local zshrc_local="$HOME/.zshrc.local"
+    [[ -f "$zshrc_local" ]] || return 0
+
+    if update_is_read_only_mode; then
+        if grep -qE 'alias bv=|if \[.*\.local/bin/bv.*\]; then' "$zshrc_local" 2>/dev/null; then
+            log_item "skip" "legacy cleanup" "dry-run: would remove stale bv alias block from .zshrc.local"
+        fi
+        return 0
+    fi
+
+    # The bv() function in acfs.zshrc handles beads_viewer PATH resolution.
+    # Any leftover "alias bv=" in .zshrc.local causes zsh parse errors
+    # ("defining function based on alias 'bv'") when acfs.zshrc tries to
+    # define the bv() function after .zshrc.local has already created an alias.
+    #
+    # The alias was typically inside an if/elif/fi block like:
+    #   # === BV ...
+    #   if [ -x "$HOME/.local/bin/bv" ]; then
+    #       alias bv="..."
+    #   elif ...
+    #   fi
+    # A naive sed '/alias bv=/d' leaves orphaned if/elif/fi with empty
+    # bodies — a syntax error.  We must remove the entire block.
+    # Strategy: target the specific if/elif/fi block containing bv aliases
+    # or their skeletons.  Do NOT use '/^# === BV/,/^fi$/d' because the
+    # BV comment may precede a for/done block (PATH setup) with no fi,
+    # causing sed to delete to EOF.
+    if grep -q 'alias bv=' "$zshrc_local" 2>/dev/null; then
+        # Remove the if/elif/fi block containing bv alias checks
+        sed -i '/^if \[.*\.local\/bin\/bv.*\]; then/,/^fi$/d' "$zshrc_local"
+        # Safety net: remove any standalone alias bv= lines
+        sed -i '/alias bv=/d' "$zshrc_local"
+        log_item "ok" "legacy cleanup" "removed stale bv alias block from .zshrc.local"
+        log_to_file "Removed bv alias block from $zshrc_local"
+    fi
+
+    # Also clean up orphaned if/elif/fi skeletons left by earlier runs
+    # that only deleted the alias lines but not the surrounding block.
+    if grep -q 'if \[.*\.local\/bin\/bv.*\]; then' "$zshrc_local" 2>/dev/null; then
+        sed -i '/^if \[.*\.local\/bin\/bv.*\]; then/,/^fi$/d' "$zshrc_local"
+        log_item "ok" "legacy cleanup" "removed orphaned bv if/elif/fi skeleton from .zshrc.local"
+        log_to_file "Removed orphaned bv block skeleton from $zshrc_local"
+    fi
+}
+
+# Fix stale aliases in deployed acfs.zshrc
+# Older versions aliased br='bun run dev', which shadows beads_rust (br).
+cleanup_legacy_br_alias() {
+    local deployed="$HOME/.acfs/zsh/acfs.zshrc"
+    [[ -f "$deployed" ]] || return 0
+
+    if update_is_read_only_mode; then
+        if grep -q "^alias br='bun run dev'" "$deployed" 2>/dev/null; then
+            log_item "skip" "legacy cleanup" "dry-run: would fix br alias conflict in deployed acfs.zshrc"
+        fi
+        return 0
+    fi
+
+    # Check for the exact problematic alias (uncommented)
+    if grep -q "^alias br='bun run dev'" "$deployed" 2>/dev/null; then
+        # Comment out the old alias (sync_acfs_zshrc will deploy the correct version later;
+        # this sed is a safety net for when the repo isn't available)
+        sed -i "s|^alias br='bun run dev'|# alias br='bun run dev'  # disabled - conflicts with beads_rust (br)|" "$deployed"
+        log_item "ok" "legacy cleanup" "fixed br alias conflict in deployed acfs.zshrc"
+        log_to_file "Commented out alias br='bun run dev' in $deployed"
+    fi
+}
+
+# Re-deploy acfs.zshrc from repo to ~/.acfs/ if repo copy is newer
+sync_acfs_zshrc() {
+    local repo_zshrc="$ACFS_REPO_ROOT/acfs/zsh/acfs.zshrc"
+    local deployed_zshrc="$HOME/.acfs/zsh/acfs.zshrc"
+
+    [[ -f "$repo_zshrc" ]] || return 0
+
+    # Skip if deployed copy is identical
+    if [[ -f "$deployed_zshrc" ]] && cmp -s "$repo_zshrc" "$deployed_zshrc"; then
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_item "ok" "acfs.zshrc" "would sync from repo (changed)"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$deployed_zshrc")"
+    cp "$repo_zshrc" "$deployed_zshrc"
+    log_item "ok" "acfs.zshrc" "synced from repo"
+    log_to_file "Deployed $repo_zshrc -> $deployed_zshrc"
+}
+
+sync_acfs_zsh_loader() {
+    local user_zshrc="$HOME/.zshrc"
+    local acfs_loader_source='source "$HOME/.acfs/zsh/acfs.zshrc"'
+    local stale_local_source='[ -f "$HOME/.zshrc.local" ] && source "$HOME/.zshrc.local"'
+
+    [[ -f "$user_zshrc" ]] || return 0
+
+    if ! grep -Fq "$acfs_loader_source" "$user_zshrc" 2>/dev/null; then
+        return 0
+    fi
+
+    if ! grep -Fq "$stale_local_source" "$user_zshrc" 2>/dev/null; then
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_item "ok" "acfs.zsh loader" "would remove duplicate ~/.zshrc.local sourcing from ~/.zshrc"
+        return 0
+    fi
+
+    sed -i '\|^\[ -f "\$HOME/\.zshrc\.local" \] && source "\$HOME/\.zshrc\.local"$|d' "$user_zshrc"
+    log_item "ok" "acfs.zsh loader" "removed duplicate ~/.zshrc.local sourcing from ~/.zshrc"
+    log_to_file "Removed duplicate .zshrc.local sourcing from $user_zshrc"
+}
+
+sync_acfs_profile_paths() {
+    local user_profile="$HOME/.profile"
+    local legacy_path_line='export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"'
+    local current_path_line='export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.atuin/bin:$PATH"'
+
+    [[ -f "$user_profile" ]] || return 0
+
+    if ! grep -Fq "$legacy_path_line" "$user_profile" 2>/dev/null; then
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_item "ok" "acfs.profile" "would update login PATH to include ~/.atuin/bin"
+        return 0
+    fi
+
+    sed -i "s|$(printf '%s' "$legacy_path_line" | sed 's/[.[\\*^$()+?{|]/\\&/g')|$current_path_line|" "$user_profile"
+    log_item "ok" "acfs.profile" "updated login PATH to include ~/.atuin/bin"
+    log_to_file "Updated ACFS-managed PATH line in $user_profile"
+}
+
+sync_acfs_zprofile_paths() {
+    local user_zprofile="$HOME/.zprofile"
+    local legacy_path_line='export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$PATH"'
+    local current_path_line='export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.atuin/bin:$PATH"'
+
+    [[ -f "$user_zprofile" ]] || return 0
+
+    if ! grep -Fq "$legacy_path_line" "$user_zprofile" 2>/dev/null; then
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_item "ok" "acfs.zprofile" "would update login PATH to include ~/.atuin/bin"
+        return 0
+    fi
+
+    sed -i "s|$(printf '%s' "$legacy_path_line" | sed 's/[.[\\*^$()+?{|]/\\&/g')|$current_path_line|" "$user_zprofile"
+    log_item "ok" "acfs.zprofile" "updated login PATH to include ~/.atuin/bin"
+    log_to_file "Updated ACFS-managed PATH line in $user_zprofile"
+}
+
+# Sync critical scripts from the git repo to ~/.acfs/ so that subsequent
+# runs of 'acfs update' (invoked from ~/.acfs/scripts/lib/update.sh) use
+# the latest code.  Without this, fleet machines that run from the
+# tarball-installed ~/.acfs/ never pick up fixes to update.sh, security.sh,
+# or checksums.yaml — the self-update pulls into the git repo but the
+# deployed copies at ~/.acfs/ remain stale.
+sync_acfs_deployed() {
+    local acfs_home="${ACFS_HOME:-$HOME/.acfs}"
+
+    # Only sync when the repo is a different directory from ~/.acfs
+    local resolved_repo resolved_home
+    resolved_repo="$(realpath "$ACFS_REPO_ROOT" 2>/dev/null || printf '%s' "$ACFS_REPO_ROOT")"
+    resolved_home="$(realpath "$acfs_home" 2>/dev/null || printf '%s' "$acfs_home")"
+    [[ "$resolved_repo" != "$resolved_home" ]] || return 0
+
+    local -a file_pairs=(
+        # repo-relative-path : deployed-relative-path
+        "scripts/lib/doctor.sh:scripts/lib/doctor.sh"
+        "scripts/lib/doctor.sh:bin/acfs"
+        "scripts/acfs-update:bin/acfs-update"
+        "scripts/services-setup.sh:scripts/services-setup.sh"
+        "scripts/lib/info.sh:scripts/lib/info.sh"
+        "scripts/lib/status.sh:scripts/lib/status.sh"
+        "scripts/lib/changelog.sh:scripts/lib/changelog.sh"
+        "scripts/lib/export-config.sh:scripts/lib/export-config.sh"
+        "scripts/lib/continue.sh:scripts/lib/continue.sh"
+        "scripts/lib/session.sh:scripts/lib/session.sh"
+        "scripts/lib/cheatsheet.sh:scripts/lib/cheatsheet.sh"
+        "scripts/lib/dashboard.sh:scripts/lib/dashboard.sh"
+        "scripts/lib/support.sh:scripts/lib/support.sh"
+        "scripts/lib/update.sh:scripts/lib/update.sh"
+        "scripts/lib/contract.sh:scripts/lib/contract.sh"
+        "scripts/lib/nightly_update.sh:scripts/lib/nightly_update.sh"
+        "scripts/lib/nightly_update.sh:scripts/nightly-update.sh"
+        "scripts/lib/security.sh:scripts/lib/security.sh"
+        "scripts/templates/acfs-nightly-update.service:scripts/templates/acfs-nightly-update.service"
+        "scripts/templates/acfs-nightly-update.timer:scripts/templates/acfs-nightly-update.timer"
+        "checksums.yaml:checksums.yaml"
+        "acfs/zsh/acfs.zshrc:zsh/acfs.zshrc"
+        "acfs/zsh/p10k.zsh:zsh/p10k.zsh"
+        "VERSION:VERSION"
+    )
+
+    local synced=0
+    for pair in "${file_pairs[@]}"; do
+        local repo_rel="${pair%%:*}"
+        local deployed_rel="${pair##*:}"
+        local repo_file="$ACFS_REPO_ROOT/$repo_rel"
+        local deployed_file="$acfs_home/$deployed_rel"
+
+        [[ -f "$repo_file" ]] || continue
+
+        # Skip if identical
+        if [[ -f "$deployed_file" ]] && cmp -s "$repo_file" "$deployed_file"; then
+            continue
+        fi
+
+        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            log_to_file "Would sync $repo_rel -> $deployed_file"
+            synced=$((synced + 1))
+            continue
+        fi
+
+        mkdir -p "$(dirname "$deployed_file")"
+        cp "$repo_file" "$deployed_file"
+        chmod --reference="$repo_file" "$deployed_file" 2>/dev/null || true
+        log_to_file "Synced $repo_rel -> $deployed_file"
+        synced=$((synced + 1))
+    done
+
+    local generated_script=""
+    local generated_name=""
+    for generated_script in "$ACFS_REPO_ROOT/scripts/generated/"*.sh; do
+        [[ -f "$generated_script" ]] || continue
+        generated_name="$(basename "$generated_script")"
+        local deployed_generated="$acfs_home/scripts/generated/$generated_name"
+
+        if [[ -f "$deployed_generated" ]] && cmp -s "$generated_script" "$deployed_generated"; then
+            continue
+        fi
+
+        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            log_to_file "Would sync scripts/generated/$generated_name -> $deployed_generated"
+            synced=$((synced + 1))
+            continue
+        fi
+
+        mkdir -p "$(dirname "$deployed_generated")"
+        cp "$generated_script" "$deployed_generated"
+        chmod --reference="$generated_script" "$deployed_generated" 2>/dev/null || true
+        log_to_file "Synced scripts/generated/$generated_name -> $deployed_generated"
+        synced=$((synced + 1))
+    done
+
+    if [[ $synced -gt 0 ]]; then
+        log_to_file "Synced $synced file(s) from repo to $acfs_home"
+    fi
+}
+
+sync_acfs_global_wrapper() {
+    local repo_file="$ACFS_REPO_ROOT/scripts/acfs-global"
+    local deployed_file="/usr/local/bin/acfs"
+    local install_cmd=(install -m 0755 "$repo_file" "$deployed_file")
+
+    [[ -f "$repo_file" ]] || return 0
+    if [[ -f "$deployed_file" ]] && cmp -s "$repo_file" "$deployed_file"; then
+        return 0
+    fi
+
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        log_to_file "Would sync scripts/acfs-global -> $deployed_file"
+        return 0
+    fi
+
+    if [[ $EUID -eq 0 ]]; then
+        "${install_cmd[@]}"
+        log_to_file "Synced scripts/acfs-global -> $deployed_file"
+        return 0
+    fi
+
+    if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+        sudo -n "${install_cmd[@]}"
+        log_to_file "Synced scripts/acfs-global -> $deployed_file"
+        return 0
+    fi
+
+    log_to_file "Skipped syncing scripts/acfs-global -> $deployed_file (needs root)"
+    return 0
+}
+
+# ============================================================
+# Checksums Refresh (Auto-update from GitHub)
+# ============================================================
+
+CHECKSUMS_URL="https://raw.githubusercontent.com/${ACFS_REPO_OWNER}/${ACFS_REPO_NAME}/${ACFS_CHECKSUMS_REF}/checksums.yaml"
+CHECKSUMS_LOCAL="${ACFS_HOME:-$HOME/.acfs}/checksums.yaml"
+
+update_resolve_checksums_file() {
+    local installed_checksums="$CHECKSUMS_LOCAL"
+    local repo_checksums=""
+    local default_acfs_home="${ACFS_HOME:-$HOME/.acfs}"
+
+    if [[ -n "${ACFS_REPO_ROOT:-}" ]] && [[ -r "${ACFS_REPO_ROOT}/checksums.yaml" ]]; then
+        repo_checksums="${ACFS_REPO_ROOT}/checksums.yaml"
+    fi
+
+    # When running update.sh from a repo checkout, prefer the repo's committed
+    # checksums over any installed ~/.acfs cache so local development does not
+    # inherit stale metadata from an older ACFS install.
+    if [[ -n "$repo_checksums" ]] && [[ "${ACFS_REPO_ROOT}" != "$default_acfs_home" ]]; then
+        printf '%s\n' "$repo_checksums"
+        return 0
+    fi
+
+    if [[ -r "$installed_checksums" ]]; then
+        printf '%s\n' "$installed_checksums"
+        return 0
+    fi
+
+    if [[ -n "$repo_checksums" ]]; then
+        printf '%s\n' "$repo_checksums"
+        return 0
+    fi
+
+    return 1
+}
+
+# Refresh checksums.yaml from GitHub before verifying installers
+# This ensures we always have the latest checksums without requiring
+# a full ACFS re-install.
+refresh_checksums() {
+    local quiet="${1:-false}"
+
+    # Create directory if needed
+    mkdir -p "$(dirname "$CHECKSUMS_LOCAL")"
+
+    # Download with timeout and retry
+    local tmp_checksums
+    tmp_checksums=$(mktemp "${TMPDIR:-/tmp}/acfs-checksums.XXXXXX" 2>/dev/null || true)
+    if [[ -z "$tmp_checksums" ]]; then
+        [[ "$quiet" != "true" ]] && log_item "warn" "checksums refresh" "failed to create temp file, using cached"
+        log_to_file "Checksums refresh failed: mktemp failed"
+        return 1
+    fi
+
+    # Use --proto/--proto-redir to enforce HTTPS (matches install.sh / security.sh policy)
+    local -a _refresh_curl_args=(--connect-timeout 5 --max-time 30 -fsSL)
+    if command -v curl &>/dev/null && curl --help all 2>/dev/null | grep -q -- '--proto'; then
+        _refresh_curl_args=(--proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 30 -fsSL)
+    fi
+    if curl "${_refresh_curl_args[@]}" -o "$tmp_checksums" "$CHECKSUMS_URL" 2>/dev/null; then
+        # Validate it looks like a checksums file
+        if grep -q "^installers:" "$tmp_checksums" 2>/dev/null; then
+            if mv "$tmp_checksums" "$CHECKSUMS_LOCAL" 2>/dev/null; then
+                chmod 644 "$CHECKSUMS_LOCAL" 2>/dev/null || true  # Ensure readable permissions
+                if [[ "$quiet" != "true" ]]; then
+                    log_item "ok" "checksums refresh" "synced from GitHub"
+                fi
+                log_to_file "Refreshed checksums.yaml from $CHECKSUMS_URL"
+                return 0
+            else
+                rm -f "$tmp_checksums"
+                [[ "$quiet" != "true" ]] && log_item "warn" "checksums refresh" "failed to install, using cached"
+                log_to_file "Checksums refresh failed: mv failed"
+                return 1
+            fi
+        else
+            rm -f "$tmp_checksums"
+            [[ "$quiet" != "true" ]] && log_item "warn" "checksums refresh" "invalid format, using cached"
+            log_to_file "Checksums refresh failed: invalid format"
+            return 1
+        fi
+    else
+        rm -f "$tmp_checksums"
+        [[ "$quiet" != "true" ]] && log_item "warn" "checksums refresh" "network error, using cached"
+        log_to_file "Checksums refresh failed: network error"
+        return 1
+    fi
+}
+
+# ============================================================
+# Upstream installer verification (checksums.yaml)
+# ============================================================
+
+UPDATE_SECURITY_READY=false
+update_require_security() {
+    if [[ "${UPDATE_SECURITY_READY}" == "true" ]]; then
+        return 0
+    fi
+
+    # Refresh checksums from GitHub before loading
+    # This ensures we have the latest checksums when security verification is needed
+    refresh_checksums "${QUIET:-false}" || true
+
+    # Check for security.sh in expected locations
+    local security_script=""
+    local candidate=""
+    local -a security_candidates=(
+        "${ACFS_BIN_DIR:-$HOME/.local/bin}/security.sh"
+        "${ACFS_HOME:-$HOME/.acfs}/scripts/lib/security.sh"
+    )
+    if [[ -n "${ACFS_REPO_ROOT:-}" ]]; then
+        security_candidates+=("${ACFS_REPO_ROOT}/scripts/lib/security.sh")
+    fi
+
+    for candidate in "${security_candidates[@]}"; do
+        if [[ -n "$candidate" ]] && [[ -f "$candidate" ]]; then
+            security_script="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$security_script" ]]; then
+        echo "" >&2
+        echo "═══════════════════════════════════════════════════════════════" >&2
+        echo "  ERROR: security.sh not found" >&2
+        echo "═══════════════════════════════════════════════════════════════" >&2
+        echo "" >&2
+        echo "  The security verification script is missing." >&2
+        echo "  This is required for --stack updates." >&2
+        echo "" >&2
+        echo "  Checked locations:" >&2
+        printf '    - %s\n' "${security_candidates[@]}" >&2
+        echo "" >&2
+        echo "  This usually means:" >&2
+        echo "    1. You have an older ACFS installation, OR" >&2
+        echo "    2. The installation didn't complete fully" >&2
+        echo "" >&2
+        echo "  TO FIX: Re-run the ACFS installer:" >&2
+        echo "" >&2
+        echo "    curl -fsSL https://agent-flywheel.com/install | bash -s -- --yes" >&2
+        echo "" >&2
+        echo "═══════════════════════════════════════════════════════════════" >&2
+        echo "" >&2
+        return 1
+    fi
+
+    local resolved_checksums_file=""
+    resolved_checksums_file="$(update_resolve_checksums_file 2>/dev/null || true)"
+    if [[ -n "$resolved_checksums_file" ]]; then
+        export CHECKSUMS_FILE="$resolved_checksums_file"
+    fi
+    # shellcheck disable=SC1090,SC1091  # runtime-resolved absolute path source
+    source "$security_script"
+    load_checksums || return 1
+
+    UPDATE_SECURITY_READY=true
+    return 0
+}
+
+update_is_linux_arm64() {
+    local arch=""
+    arch="$(uname -m 2>/dev/null || true)"
+    [[ "$(uname -s 2>/dev/null)" == "Linux" ]] && [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]
+}
+
+update_run_meta_skill_source_install() {
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "meta_skill ARM64 Linux fallback requires cargo in PATH" >&2
+        return 1
+    fi
+
+    echo "meta_skill: Linux ARM64 detected, building from source via cargo" >&2
+    cargo install --git https://github.com/Dicklesworthstone/meta_skill --force
+}
+
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via run_cmd()
+update_run_slb_source_install() {
+    log_to_file "Building SLB from source (upstream installer issue workaround)"
+
+    local build_cmd
+    build_cmd="$(cat <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME/go/bin"
+SLB_TMP="$(mktemp -d "${TMPDIR:-/tmp}/slb_build.XXXXXX")"
+trap '[ -n "$SLB_TMP" ] && rm -rf "$SLB_TMP"' EXIT
+cd "$SLB_TMP"
+git clone --depth 1 https://github.com/Dicklesworthstone/simultaneous_launch_button.git .
+go build -o "$HOME/go/bin/slb" ./cmd/slb
+EOF
+)"
+    update_run_in_target_context "" bash -c "$build_cmd"
+}
+
+# ============================================================
+# Verified Installer Wrappers
+# ============================================================
+# Download an upstream installer, verify its SHA-256 checksum
+# against checksums.yaml, and execute it in the target context.
+# ============================================================
+
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via run_cmd()
+update_run_verified_installer_with_env() {
+    if [[ $# -lt 1 ]]; then
+        echo "update_run_verified_installer_with_env requires a tool name" >&2
+        return 1
+    fi
+
+    local tool="$1"
+    local bash_env_assignment="${2:-}"
+    if [[ $# -ge 2 ]]; then
+        shift 2
+    else
+        shift
+    fi
+
+    if [[ "$tool" == "ms" ]] && update_is_linux_arm64; then
+        update_run_meta_skill_source_install
+        return $?
+    fi
+
+    if ! update_require_security; then
+        echo "Security verification unavailable (missing $SCRIPT_DIR/security.sh, repo scripts/lib/security.sh, or checksums.yaml)" >&2
+        return 1
+    fi
+
+    # Guard: verify_checksum() sets a RETURN trap referencing $tmp_file.
+    # Under some bash versions the trap can leak into the caller scope;
+    # declaring the variable here prevents "unbound variable" under set -u.
+    local tmp_file=""
+
+    local url="${KNOWN_INSTALLERS[$tool]:-}"
+    local expected_sha256
+    expected_sha256="$(get_checksum "$tool")"
+
+    if [[ -z "$url" ]] || [[ -z "$expected_sha256" ]]; then
+        echo "Missing checksum entry for $tool" >&2
+        return 1
+    fi
+
+    if [[ -n "$bash_env_assignment" ]] && [[ ! "$bash_env_assignment" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+$ ]]; then
+        echo "Invalid inline env assignment for $tool installer: $bash_env_assignment" >&2
+        return 1
+    fi
+
+    local tmp_install=""
+    tmp_install=$(mktemp "${TMPDIR:-/tmp}/acfs-update-${tool}.XXXXXX" 2>/dev/null) || tmp_install=""
+    if [[ -z "$tmp_install" ]]; then
+        echo "Failed to create temp file for verified $tool installer" >&2
+        return 1
+    fi
+    trap 'rm -f "$tmp_install" 2>/dev/null || true' RETURN
+
+    if verify_checksum "$url" "$expected_sha256" "$tool" > "$tmp_install"; then
+        :
+    else
+        return $?
+    fi
+
+    if ! chmod +x "$tmp_install"; then
+        return 1
+    fi
+
+    local exit_code=0
+    update_run_in_target_context "$bash_env_assignment" bash "$tmp_install" "$@" </dev/null || exit_code=$?
+
+    return "$exit_code"
+}
+
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via run_cmd()
+update_run_verified_installer() {
+    if [[ $# -lt 1 ]]; then
+        echo "update_run_verified_installer requires a tool name" >&2
+        return 1
+    fi
+
+    local tool="$1"
+    shift
+    update_run_verified_installer_with_env "$tool" "" "$@"
+}
+
+# ============================================================
+# Update Functions
+# ============================================================
+
+# ------------------------------------------------------------
+# Refresh installed security.sh from the repo checkout.
+# Stale installed copies shadow the repo because
+# update_require_security() searches installed paths first.
+#
+# Note: sync_acfs_deployed() also syncs security.sh, but this
+# function provides a targeted safety net with hardcoded paths
+# that works even before sync_acfs_deployed was introduced.
+# ------------------------------------------------------------
+update_refresh_installed_security() {
+    local installed_security="${ACFS_HOME:-$HOME/.acfs}/scripts/lib/security.sh"
+    [[ -f "$installed_security" ]] || return 0
+
+    # Find the authoritative repo checkout (may differ from ACFS_REPO_ROOT
+    # when running from the installed copy at ~/.acfs).
+    local repo_security=""
+    local -a repo_candidates=(
+        "/data/projects/agentic_coding_flywheel_setup/scripts/lib/security.sh"
+        "${ACFS_REPO_ROOT}/scripts/lib/security.sh"
+    )
+    for candidate in "${repo_candidates[@]}"; do
+        # Skip if it resolves to the same file as the installed copy
+        if [[ -f "$candidate" ]] && [[ "$(realpath "$candidate" 2>/dev/null)" != "$(realpath "$installed_security" 2>/dev/null)" ]]; then
+            repo_security="$candidate"
+            break
+        fi
+    done
+    [[ -n "$repo_security" ]] || return 0
+
+    local repo_sec_hash installed_sec_hash
+    repo_sec_hash=$(sha256sum "$repo_security" 2>/dev/null | cut -d' ' -f1) || true
+    installed_sec_hash=$(sha256sum "$installed_security" 2>/dev/null | cut -d' ' -f1) || true
+    if [[ -n "$repo_sec_hash" ]] && [[ "$repo_sec_hash" != "$installed_sec_hash" ]]; then
+        cp "$repo_security" "$installed_security"
+        log_to_file "Refreshed installed security.sh from $repo_security (was stale)"
+    fi
+}
+
+# ------------------------------------------------------------
+# Extract security-critical files from an already-fetched remote.
+# Called when a full git pull is not possible (dirty worktree,
+# ff-only failure, wrong branch, etc.) but we still need fresh
+# checksums and URLs so verified-installer checks don't break.
+# Requires: git fetch origin main has already succeeded.
+# ------------------------------------------------------------
+_acfs_refresh_security_from_fetched_remote() {
+    local _sec_files_refreshed=false
+    local _sec_relpath
+    for _sec_relpath in checksums.yaml scripts/lib/security.sh; do
+        local _sec_target="$ACFS_REPO_ROOT/$_sec_relpath"
+        local _sec_tmp=""
+        _sec_tmp="$(mktemp "${TMPDIR:-/tmp}/acfs-sec-refresh.XXXXXX" 2>/dev/null)" || continue
+        if git -C "$ACFS_REPO_ROOT" show "origin/main:$_sec_relpath" > "$_sec_tmp" 2>/dev/null; then
+            if [[ -s "$_sec_tmp" ]] && ! cmp -s "$_sec_tmp" "$_sec_target" 2>/dev/null; then
+                cp -f "$_sec_tmp" "$_sec_target" 2>/dev/null && _sec_files_refreshed=true
+                log_to_file "Refreshed $_sec_relpath from origin/main (bypassing full pull)"
+            fi
+        fi
+        rm -f "$_sec_tmp" 2>/dev/null
+    done
+
+    if [[ "$_sec_files_refreshed" == "true" ]]; then
+        log_item "ok" "ACFS checksums" "refreshed from remote"
+        update_refresh_installed_security
+        sync_acfs_deployed
+        sync_acfs_global_wrapper
+    fi
+}
+
+_acfs_remote_main_head() {
+    git -C "$ACFS_REPO_ROOT" ls-remote --heads origin main 2>/dev/null | awk 'NR==1 { print $1 }'
+}
+
+# ------------------------------------------------------------
+# Self-Update: Update ACFS itself before anything else
+# ------------------------------------------------------------
+# This ensures users always have the latest update logic,
+# security fixes, and new tool definitions.
+# ------------------------------------------------------------
+update_acfs_self() {
+    log_section "ACFS Self-Update"
+
+    # Skip if disabled
+    if [[ "$UPDATE_SELF" != "true" ]]; then
+        log_item "skip" "ACFS self-update" "disabled via --no-self-update"
+        return 0
+    fi
+
+    # Skip if already done (prevents infinite re-exec loops)
+    if [[ "$ACFS_SELF_UPDATE_DONE" == "true" ]]; then
+        log_item "skip" "ACFS self-update" "already completed"
+        return 0
+    fi
+
+    # Recovery for orphaned git init (issue #200)
+    if [[ -d "$ACFS_REPO_ROOT/.git" ]] && ! git -C "$ACFS_REPO_ROOT" rev-parse HEAD &>/dev/null; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_item "ok" "ACFS self-update" "would recover incomplete git bootstrap"
+            return 0
+        fi
+        log_to_file "Detected incomplete git bootstrap — attempting recovery..."
+        local actual_origin
+        actual_origin=$(git -C "$ACFS_REPO_ROOT" remote get-url origin 2>/dev/null || true)
+        if is_expected_acfs_origin_url "$actual_origin"; then
+            if ! git -C "$ACFS_REPO_ROOT" fetch origin main --quiet 2>/dev/null; then
+                log_item "warn" "ACFS self-update" "git recovery fetch failed; leaving existing .git untouched"
+                return 0
+            fi
+
+            if git -C "$ACFS_REPO_ROOT" checkout -f -B main --track origin/main; then
+                log_to_file "Git bootstrap recovery succeeded"
+            else
+                log_item "warn" "ACFS self-update" "git recovery checkout failed; leaving existing .git untouched"
+                return 0
+            fi
+        else
+            log_item "warn" "ACFS self-update" "unexpected origin during git recovery: ${actual_origin:-<unset>}"
+            return 0
+        fi
+    fi
+
+    # Check if ACFS repo exists and is a git repo.
+    # If installed via tarball (no .git dir), require an explicit opt-in before
+    # converting the install into a git checkout. Automatic bootstrap can
+    # overwrite local files under ~/.acfs, which is too surprising for routine
+    # update and nightly flows.
+    if [[ ! -d "$ACFS_REPO_ROOT/.git" ]]; then
+        if [[ "$BOOTSTRAP_SELF_UPDATE" != "true" ]]; then
+            log_item "skip" "ACFS self-update" "installed tree is not a git checkout; skipping to avoid overwriting local files (use --bootstrap-self-update to opt in)"
+            return 0
+        fi
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_item "ok" "ACFS self-update" "would bootstrap git checkout from https://github.com/${ACFS_REPO_OWNER}/${ACFS_REPO_NAME}.git"
+            return 0
+        fi
+
+        log_to_file "No .git directory found at $ACFS_REPO_ROOT — bootstrapping git repo for self-update..."
+
+        # Check if git is available before attempting bootstrap
+        if ! command -v git &>/dev/null; then
+            log_item "skip" "ACFS self-update" "git not found, cannot bootstrap"
+            return 0
+        fi
+
+        if ! git -C "$ACFS_REPO_ROOT" init -b main 2>/dev/null; then
+            log_item "warn" "ACFS self-update" "git init failed at $ACFS_REPO_ROOT"
+            return 0
+        fi
+
+        local expected_origin
+        expected_origin="https://github.com/${ACFS_REPO_OWNER}/${ACFS_REPO_NAME}.git"
+        if ! git -C "$ACFS_REPO_ROOT" remote add origin "$expected_origin" 2>/dev/null; then
+            # Remote may already exist from a partial prior run; verify it points to the right URL
+            local existing_url
+            existing_url=$(git -C "$ACFS_REPO_ROOT" remote get-url origin 2>/dev/null) || true
+            if ! is_expected_acfs_origin_url "$existing_url"; then
+                log_item "warn" "ACFS self-update" "unexpected origin remote: $existing_url"
+                return 0
+            fi
+        fi
+
+        if ! git -C "$ACFS_REPO_ROOT" fetch origin main --quiet 2>/dev/null; then
+            log_item "warn" "ACFS self-update" "git fetch failed during bootstrap (network issue?)"
+            return 0
+        fi
+
+        # Use a forced checkout so the working tree is updated to match
+        # origin/main exactly (tarball files are replaced with the real repo state).
+        # -f is required because the tarball-installed files appear as untracked
+        # and git refuses to overwrite them without force.
+        if ! git -C "$ACFS_REPO_ROOT" checkout -f -B main --track origin/main; then
+            log_item "warn" "ACFS self-update" "git checkout failed during bootstrap"
+            return 0
+        fi
+
+        log_item "ok" "ACFS" "git repo bootstrapped from tarball install"
+        log_to_file "ACFS git repo initialized at $ACFS_REPO_ROOT — continuing with self-update"
+    fi
+
+    # Check if git is available
+    if ! command -v git &>/dev/null; then
+        log_item "skip" "ACFS self-update" "git not found"
+        return 0
+    fi
+
+    # Security: verify we are pulling from the expected ACFS origin.
+    # Do this for normal runs too (not only bootstrap mode) to prevent
+    # accidental or malicious self-update from an unexpected remote.
+    local origin_url
+    origin_url=$(git -C "$ACFS_REPO_ROOT" remote get-url origin 2>/dev/null || true)
+    if [[ -z "$origin_url" ]]; then
+        log_item "warn" "ACFS self-update" "origin remote not configured"
+        return 0
+    fi
+    if ! is_expected_acfs_origin_url "$origin_url"; then
+        log_item "warn" "ACFS self-update" "unexpected origin remote: $origin_url"
+        return 0
+    fi
+
+    # Get current branch
+    local current_branch=""
+    current_branch=$(git -C "$ACFS_REPO_ROOT" branch --show-current 2>/dev/null) || true
+    if [[ -z "$current_branch" ]] || [[ "$current_branch" == "HEAD" ]]; then
+        log_item "warn" "ACFS self-update" "failed to get current branch"
+        return 0
+    fi
+
+    # Only auto-update on main branch, but still refresh security files
+    if [[ "$current_branch" != "main" ]]; then
+        log_item "skip" "ACFS self-update" "not on main branch (on: $current_branch)"
+        if update_is_read_only_mode; then
+            return 0
+        fi
+        # Still fetch and refresh security files so checksums stay fresh
+        if git -C "$ACFS_REPO_ROOT" fetch origin main --quiet 2>/dev/null; then
+            _acfs_refresh_security_from_fetched_remote
+        fi
+        return 0
+    fi
+
+    local local_head=""
+    local remote_head=""
+    local_head=$(git -C "$ACFS_REPO_ROOT" rev-parse HEAD 2>/dev/null) || true
+
+    if update_is_read_only_mode; then
+        remote_head="$(_acfs_remote_main_head)"
+        if [[ -z "$local_head" ]] || [[ -z "$remote_head" ]]; then
+            log_item "warn" "ACFS self-update" "failed to compare versions in dry-run"
+            return 0
+        fi
+
+        if [[ "$local_head" == "$remote_head" ]]; then
+            log_item "ok" "ACFS $ACFS_VERSION_DISPLAY" "already up to date"
+        else
+            log_item "ok" "ACFS" "would update (remote main differs)"
+        fi
+        return 0
+    fi
+
+    # Save current update.sh hash for re-exec detection
+    local update_script="$SCRIPT_DIR/update.sh"
+    local old_hash=""
+    if [[ -f "$update_script" ]]; then
+        old_hash=$(sha256sum "$update_script" 2>/dev/null | cut -d' ' -f1) || true
+    fi
+
+    # Fetch latest from origin
+    log_to_file "Fetching from origin..."
+    if ! git -C "$ACFS_REPO_ROOT" fetch origin main --quiet 2>/dev/null; then
+        log_item "warn" "ACFS self-update" "git fetch failed (network issue?)"
+        return 0
+    fi
+
+    # Compare local HEAD with remote
+    local_head=$(git -C "$ACFS_REPO_ROOT" rev-parse HEAD 2>/dev/null) || true
+    remote_head=$(git -C "$ACFS_REPO_ROOT" rev-parse origin/main 2>/dev/null) || true
+
+    if [[ -z "$local_head" ]] || [[ -z "$remote_head" ]]; then
+        log_item "warn" "ACFS self-update" "failed to compare versions"
+        return 0
+    fi
+
+    if [[ "$local_head" == "$remote_head" ]]; then
+        log_item "ok" "ACFS $ACFS_VERSION_DISPLAY" "already up to date"
+        update_refresh_installed_security
+        return 0
+    fi
+
+    # Show what's coming
+    local commit_count
+    commit_count=$(git -C "$ACFS_REPO_ROOT" rev-list --count HEAD..origin/main 2>/dev/null) || commit_count="?"
+    log_to_file "Found $commit_count new commit(s)"
+
+    # Dry run mode
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_item "ok" "ACFS" "would update ($commit_count new commits)"
+        return 0
+    fi
+
+    # Skip full git pull if tracked files have local modifications to avoid
+    # merge conflicts. Use --untracked-files=no because ~/.acfs/ contains
+    # runtime state files (state.json, logs/, cache/, autofix/) that are
+    # not in the git repo — these must not block self-update since
+    # git pull --ff-only never touches untracked files.
+    #
+    # Even when we can't pull, we STILL extract security-critical files
+    # (checksums.yaml, security.sh) from the fetched remote so that
+    # verified-installer checks use fresh checksums and URLs. Without this,
+    # machines with local modifications run with stale checksums indefinitely,
+    # causing constant checksum-mismatch failures for Dicklesworthstone tools.
+    if [[ -n "$(git -C "$ACFS_REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+        log_item "warn" "ACFS self-update" "tracked files have local modifications; skipping full pull"
+        log_to_file "Self-update skipped: working tree has tracked modifications — refreshing security files only"
+        _acfs_refresh_security_from_fetched_remote
+        return 0
+    fi
+
+    # Pull updates
+    log_to_file "Pulling updates..."
+    if ! git -C "$ACFS_REPO_ROOT" pull --ff-only origin main 2>/dev/null; then
+        log_item "warn" "ACFS self-update" "ff-only pull failed (branch divergence?); refreshing security files"
+        log_to_file "Self-update skipped: git pull --ff-only failed — refreshing security files only"
+        _acfs_refresh_security_from_fetched_remote
+        return 0
+    fi
+
+    # Refresh version display with new commit hash after pull
+    local _new_short_hash=""
+    _new_short_hash=$(git -C "$ACFS_REPO_ROOT" rev-parse --short HEAD 2>/dev/null) || true
+    if [[ -n "$_new_short_hash" ]]; then
+        # Re-read VERSION in case it changed
+        if [[ -f "$ACFS_REPO_ROOT/VERSION" ]]; then
+            ACFS_VERSION="$(cat "$ACFS_REPO_ROOT/VERSION" 2>/dev/null || echo "$ACFS_VERSION")"
+        fi
+        ACFS_VERSION_DISPLAY="v${ACFS_VERSION}+${_new_short_hash}"
+    fi
+
+    log_item "ok" "ACFS $ACFS_VERSION_DISPLAY" "updated ($commit_count commits)"
+    log_to_file "ACFS updated from $local_head to $remote_head"
+
+    update_refresh_installed_security
+
+    # Sync critical scripts from repo to ~/.acfs/ so the deployed copies
+    # stay fresh.  This MUST happen before the re-exec check below, because
+    # $update_script points to ~/.acfs/scripts/lib/update.sh — if we don't
+    # copy the new version there first, the hash comparison won't trigger
+    # the re-exec and future runs will use the old code.
+    sync_acfs_deployed
+    sync_acfs_global_wrapper
+
+    # Check if update.sh itself changed - if so, re-exec
+    local new_hash=""
+    if [[ -f "$update_script" ]]; then
+        new_hash=$(sha256sum "$update_script" 2>/dev/null | cut -d' ' -f1) || true
+    fi
+
+    if [[ -n "$old_hash" ]] && [[ -n "$new_hash" ]] && [[ "$old_hash" != "$new_hash" ]]; then
+        log_to_file "update.sh changed, re-executing with new version..."
+        echo ""
+        echo -e "${CYAN}update.sh was updated, restarting with new version...${NC}"
+        echo ""
+
+        # Re-exec with same args, but mark self-update as done
+        export ACFS_SELF_UPDATE_DONE=true
+        exec "$update_script" "$@"
+        # exec replaces this process, so we never reach here
+    fi
+
+    return 0
+}
+
+update_apt() {
+    if [[ "$UPDATE_APT" != "true" ]]; then
+        return 0
+    fi
+
+    log_section "System Packages (apt)"
+
+    # Check if apt/dpkg is available (Linux only)
+    if ! command -v apt-get &>/dev/null; then
+        log_item "skip" "apt" "not available (non-Debian system)"
+        return 0
+    fi
+
+    # Check for apt lock (with automatic waiting)
+    if ! check_apt_lock; then
+        return 0
+    fi
+
+    # Fix any broken packages first
+    fix_apt_issues
+
+    # Run apt update
+    run_cmd_sudo "apt update" apt-get update -y
+
+    # Get list of upgradable packages before upgrade
+    local upgradable_list=""
+    local upgrade_count=0
+    if upgradable_list=$(apt list --upgradable 2>/dev/null | grep -v "^Listing"); then
+        upgrade_count=$(echo "$upgradable_list" | { grep -c . || true; })
+        if [[ $upgrade_count -gt 0 ]]; then
+            log_to_file "Upgradable packages ($upgrade_count):"
+            log_to_file "$upgradable_list"
+        fi
+    fi
+
+    if [[ $upgrade_count -eq 0 ]]; then
+        log_item "ok" "apt upgrade" "all packages up to date"
+    else
+        log_to_file "Upgrading $upgrade_count packages..."
+        run_cmd_sudo "apt upgrade ($upgrade_count packages)" env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+    fi
+
+    run_cmd_sudo "apt autoremove" env DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
+
+    # Check if reboot is required (kernel updates, etc.)
+    check_reboot_required
+}
+
+# Wait for apt lock to be released, with automatic retry
+# Returns 0 if lock is free, 1 if still locked after max attempts
+apt_lock_is_held() {
+    local lockfile="$1"
+
+    command -v fuser &>/dev/null || return 1
+    [[ -f "$lockfile" ]] || return 1
+
+    # Try as current user first (works when lockfile is readable).
+    if fuser "$lockfile" &>/dev/null; then
+        return 0
+    fi
+
+    # Fallback to non-interactive sudo to avoid hanging in safe mode / CI.
+    if command -v sudo &>/dev/null; then
+        sudo -n fuser "$lockfile" &>/dev/null && return 0
+    fi
+
+    return 1
+}
+
+apt_lock_holder_details() {
+    local lockfile="$1"
+    local details=""
+
+    command -v fuser &>/dev/null || return 1
+    [[ -f "$lockfile" ]] || return 1
+
+    details=$(fuser -v "$lockfile" 2>&1 || true)
+    if [[ -n "$details" ]]; then
+        printf '%s\n' "$details"
+        return 0
+    fi
+
+    if command -v sudo &>/dev/null; then
+        details=$(sudo -n fuser -v "$lockfile" 2>/dev/null || true)
+        if [[ -n "$details" ]]; then
+            printf '%s\n' "$details"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+wait_for_apt_lock() {
+    local max_wait=${1:-120}  # Default 120 seconds (2 minutes)
+    local interval=5
+    local waited=0
+
+    if ! command -v fuser &>/dev/null; then
+        log_to_file "fuser not available (psmisc not installed), skipping apt lock detection"
+        return 0
+    fi
+
+    while [[ $waited -lt $max_wait ]]; do
+        # Only check actual lock files — background processes (e.g. unattended-upgrades
+        # daemon) don't hold locks unless actively installing
+        local lock_held=false
+        for lockfile in /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock; do
+            if apt_lock_is_held "$lockfile"; then
+                lock_held=true
+                break
+            fi
+        done
+
+        if [[ "$lock_held" == "false" ]]; then
+            return 0
+        fi
+
+        if [[ $waited -eq 0 ]]; then
+            log_item "wait" "apt lock" "waiting for other package operations to complete..."
+            log_to_file "APT lock detected, waiting up to ${max_wait}s for release"
+            local lock_info=""
+            lock_info=$(apt_lock_holder_details /var/lib/dpkg/lock-frontend 2>/dev/null || true)
+            [[ -n "$lock_info" ]] && log_to_file "Lock holder: $lock_info"
+        fi
+
+        sleep "$interval"
+        waited=$((waited + interval))
+
+        # Progress indicator every 30 seconds
+        if [[ $((waited % 30)) -eq 0 ]] && [[ "$QUIET" != "true" ]]; then
+            echo -e "       ${DIM}Still waiting... (${waited}s/${max_wait}s)${NC}"
+        fi
+    done
+
+    return 1
+}
+
+# Fix common dpkg/apt issues automatically
+fix_apt_issues() {
+    log_to_file "Checking for apt issues to fix..."
+
+    # Fix interrupted dpkg (check if there are pending updates)
+    if ls /var/lib/dpkg/updates/* &>/dev/null; then
+        local sudo_cmd
+        sudo_cmd=$(get_sudo)
+        log_item "fix" "dpkg" "configuring interrupted packages"
+        log_to_file "Running: $sudo_cmd dpkg --configure -a"
+        local dpkg_output
+        dpkg_output=$($sudo_cmd env DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1) || true
+        [[ -n "$dpkg_output" ]] && log_to_file "dpkg output: $dpkg_output"
+    fi
+
+    # Check for broken dependencies or packages needing reinstall
+    local needs_fix=false
+    local broken_count=0
+    broken_count=$(dpkg -l 2>/dev/null | grep -c "^..R" || true)
+    broken_count=$((broken_count + 0))  # Ensure integer
+    if [[ $broken_count -gt 0 ]]; then
+        needs_fix=true
+        log_to_file "Found $broken_count package(s) in reinstall-required state"
+    fi
+
+    # Also check if apt reports broken dependencies
+    if ! apt-get check &>/dev/null; then
+        needs_fix=true
+        log_to_file "apt-get check reported issues"
+    fi
+
+    if [[ "$needs_fix" == "true" ]]; then
+        log_item "fix" "apt" "fixing broken dependencies"
+        local sudo_cmd
+        sudo_cmd=$(get_sudo)
+        log_to_file "Running: $sudo_cmd apt-get -f install -y"
+        local apt_output
+        apt_output=$($sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get -f install -y 2>&1) || true
+        [[ -n "$apt_output" ]] && log_to_file "apt-get -f output: $apt_output"
+    fi
+}
+
+# Check if apt is locked by another process, with automatic waiting and fixing
+check_apt_lock() {
+    # Only check if actual dpkg/apt lock files are held by a process.
+    # Background daemons (e.g. unattended-upgrades) don't hold locks unless
+    # actively installing, so pgrep-based checks cause false positives.
+    local locks_held=false
+    for lockfile in /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock; do
+        if apt_lock_is_held "$lockfile"; then
+            locks_held=true
+            break
+        fi
+    done
+
+    if [[ "$locks_held" == "false" ]]; then
+        return 0  # No locks held, safe to proceed
+    fi
+
+    # Lock IS held — wait for release
+    if wait_for_apt_lock 120; then
+        log_item "ok" "apt lock" "lock released, proceeding"
+        return 0
+    fi
+
+    # Still locked after waiting — show diagnostic
+    log_item "skip" "apt" "dpkg lock held after 2m wait"
+    log_to_file "APT lock still held after waiting"
+
+    local lock_holder=""
+    lock_holder=$(apt_lock_holder_details /var/lib/dpkg/lock-frontend 2>/dev/null || true)
+    if [[ -n "$lock_holder" ]]; then
+        log_to_file "Lock holder: $lock_holder"
+        if [[ "$QUIET" != "true" ]]; then
+            echo -e "       ${DIM}Lock held by: $lock_holder${NC}"
+        fi
+    fi
+
+    if [[ "$ABORT_ON_FAILURE" == "true" ]]; then
+        echo -e "${RED}Aborting: apt is locked and could not be released${NC}"
+        log_to_file "ABORT: Stopping due to --abort-on-failure"
+        exit 1
+    fi
+
+    return 1
+}
+
+# Check if system reboot is required after updates
+check_reboot_required() {
+    if [[ -f /var/run/reboot-required ]]; then
+        log_item "warn" "Reboot required" "kernel or critical package updated"
+        log_to_file "REBOOT REQUIRED: /var/run/reboot-required exists"
+
+        if [[ -f /var/run/reboot-required.pkgs ]]; then
+            local pkgs
+            pkgs=$(cat /var/run/reboot-required.pkgs 2>/dev/null || echo "unknown")
+            log_to_file "Packages requiring reboot: $pkgs"
+            if [[ "$QUIET" != "true" ]]; then
+                echo -e "       ${DIM}Packages: $pkgs${NC}"
+            fi
+        fi
+
+        # Set a global flag for summary
+        REBOOT_REQUIRED=true
+    fi
+}
+
+update_bun() {
+    if [[ "$UPDATE_RUNTIME" != "true" ]]; then
+        return 0
+    fi
+
+    log_section "Bun Runtime"
+
+    local bun_bin="$HOME/.bun/bin/bun"
+
+    if [[ ! -x "$bun_bin" ]]; then
+        log_item "skip" "Bun" "not installed"
+        return 0
+    fi
+
+    # Capture version before update
+    capture_version_before "bun"
+
+    run_cmd "Bun self-upgrade" "$bun_bin" upgrade
+
+    # Capture version after and log if changed (don't use log_item "ok" to avoid double-counting)
+    if capture_version_after "bun"; then
+        [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[bun]}" "${VERSION_AFTER[bun]}"
+    fi
+}
+
+update_agents() {
+    if [[ "$UPDATE_AGENTS" != "true" ]]; then
+        return 0
+    fi
+
+    log_section "Coding Agents"
+
+    # Claude Code - can update without bun; supports install/reinstall with --force.
+    #
+    # Check for bun-installed Claude and remove it if native install is requested.
+    # The native install goes to ~/.local/bin/claude which should take precedence,
+    # but having both can cause PATH confusion and doctor warnings.
+    local claude_path=""
+    claude_path=$(command -v claude 2>/dev/null) || true
+    local bun_claude_detected=false
+
+    # Check if claude is bun-installed. This can happen in two ways:
+    # 1. Direct path: ~/.bun/bin/claude
+    # 2. Symlink: ~/.local/bin/claude -> ~/.bun/bin/claude (created by installer)
+    # We need to resolve symlinks to detect case 2.
+    if [[ -n "$claude_path" ]]; then
+        local resolved_path="$claude_path"
+        if [[ -L "$claude_path" ]]; then
+            resolved_path=$(readlink -f "$claude_path" 2>/dev/null) || resolved_path="$claude_path"
+        fi
+        if [[ "$claude_path" == *".bun"* || "$claude_path" == *"node_modules"* || \
+              "$resolved_path" == *".bun"* || "$resolved_path" == *"node_modules"* ]]; then
+            bun_claude_detected=true
+        fi
+    fi
+
+    if [[ "$bun_claude_detected" == "true" ]] && [[ "$FORCE_MODE" == "true" ]]; then
+        log_to_file "Removing bun-installed Claude to switch to native version: $claude_path"
+        local bun_bin="$HOME/.bun/bin/bun"
+        if [[ -x "$bun_bin" ]]; then
+            # Try to uninstall via bun
+            "$bun_bin" remove -g @anthropic-ai/claude-code 2>/dev/null || true
+        fi
+        # Also remove the symlink/binary directly if it still exists
+        if [[ -f "$claude_path" || -L "$claude_path" ]]; then
+            rm -f "$claude_path" 2>/dev/null || true
+        fi
+        # Remove the actual bun binary too if it's separate from the symlink
+        local bun_claude_bin="$HOME/.bun/bin/claude"
+        if [[ -f "$bun_claude_bin" || -L "$bun_claude_bin" ]] && [[ "$bun_claude_bin" != "$claude_path" ]]; then
+            rm -f "$bun_claude_bin" 2>/dev/null || true
+        fi
+        # Clear the cached path so we detect as "not installed" for fresh install
+        claude_path=""
+    fi
+
+    if cmd_exists claude && [[ "$bun_claude_detected" != "true" || "$FORCE_MODE" != "true" ]]; then
+        capture_version_before "claude"
+
+        # Try native update first
+        if ! run_cmd_claude_update; then
+            log_to_file "Claude update failed, attempting reinstall via official installer"
+            if update_require_security; then
+                # INTENTIONAL: verified installer is the correct fallback for failed updates
+                run_cmd "Claude Code (reinstall)" update_run_verified_installer claude latest
+            else
+                log_item "fail" "Claude Code" "update failed and reinstall unavailable (missing security.sh)"
+            fi
+        fi
+
+        # Show version change without double-counting (run_cmd already incremented SUCCESS_COUNT)
+        if capture_version_after "claude"; then
+            [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[claude]}" "${VERSION_AFTER[claude]}"
+        fi
+    elif [[ "$FORCE_MODE" == "true" ]]; then
+        capture_version_before "claude"
+        if update_require_security; then
+            # INTENTIONAL: verified installer is the correct path for fresh installs
+            run_cmd "Claude Code (install)" update_run_verified_installer claude latest
+            if capture_version_after "claude"; then
+                [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[claude]}" "${VERSION_AFTER[claude]}"
+            fi
+        else
+            log_item "fail" "Claude Code" "not installed and install unavailable (missing security.sh/checksums.yaml)"
+        fi
+    else
+        log_item "skip" "Claude Code" "not installed (use --force to install)"
+    fi
+
+    local bun_bin="$HOME/.bun/bin/bun"
+    if [[ ! -x "$bun_bin" ]]; then
+        log_item "fail" "Bun not installed" "required for Codex/Gemini updates"
+        return 0
+    fi
+
+    # Codex CLI via bun (--trust allows postinstall scripts)
+    # Uses fallback chain: @latest -> unversioned -> pinned 0.87.0
+    # npm can 404 briefly after publishing; pinned version is reliable fallback
+    if cmd_exists codex || [[ "$FORCE_MODE" == "true" ]]; then
+        local codex_bin_local="${ACFS_BIN_DIR:-$HOME/.local/bin}/codex"
+        local codex_bin_bun="$HOME/.bun/bin/codex"
+        local codex_fallback_version="0.87.0"
+
+        capture_version_before "codex"
+        
+        log_item "run" "Codex CLI"
+        local success=false
+        local output=""
+        
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_item "skip" "Codex CLI" "dry-run"
+        else
+            for pkg in "@openai/codex@latest" "@openai/codex" "@openai/codex@$codex_fallback_version"; do
+                log_to_file "Trying bun install $pkg"
+                local attempt=1
+                local pkg_success=false
+                while [[ $attempt -le 3 ]]; do
+                    if output=$("$bun_bin" install -g --trust "$pkg" 2>&1); then
+                        pkg_success=true
+                        success=true
+                        break 2
+                    fi
+                    sleep 2
+                    attempt=$((attempt + 1))
+                done
+                log_to_file "Failed $pkg after 3 attempts: $output"
+            done
+            
+            if [[ "$success" == "true" ]]; then
+                if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+                    printf "\033[1A\033[2K  ${GREEN}[ok]${NC} Codex CLI\n"
+                elif [[ "$QUIET" != "true" ]]; then
+                    printf "  ${GREEN}[ok]${NC} Codex CLI\n"
+                fi
+                ((SUCCESS_COUNT += 1))
+            else
+                if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+                    printf "\033[1A\033[2K  ${RED}[FAIL]${NC} Codex CLI\n"
+                elif [[ "$QUIET" != "true" ]]; then
+                    printf "  ${RED}[FAIL]${NC} Codex CLI\n"
+                fi
+                log_to_file "All Codex install attempts failed. Last output: $output"
+                ((FAIL_COUNT += 1))
+            fi
+        fi
+
+        # Show version change without double-counting
+        if capture_version_after "codex"; then
+            [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[codex]}" "${VERSION_AFTER[codex]}"
+        fi
+    else
+        log_item "skip" "Codex CLI" "not installed (use --force to install)"
+    fi
+
+    # Gemini CLI via bun (--trust allows postinstall scripts)
+    if cmd_exists gemini || [[ "$FORCE_MODE" == "true" ]]; then
+        local gemini_patch_ready=true
+        local gemini_nvm_bin=""
+        local gemini_patch_skip_reason="Node.js runtime unavailable"
+        capture_version_before "gemini"
+        run_cmd_bun_with_retry "Gemini CLI" "$bun_bin" install -g --trust @google/gemini-cli@latest
+        # Show version change without double-counting
+        if capture_version_after "gemini"; then
+            [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[gemini]}" "${VERSION_AFTER[gemini]}"
+        fi
+        # Apply Gemini CLI patches (EBADF crash fix, rate-limit retry, quota retry)
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_item "skip" "Node.js runtime for Gemini patch" "dry-run: ensure nvm + latest Node.js when missing"
+            gemini_patch_ready=false
+            gemini_patch_skip_reason="dry-run: would apply after ensuring nvm + latest Node.js when needed"
+        elif update_has_nvm_node; then
+            log_item "info" "Node.js runtime for Gemini patch" "nvm + latest Node.js already present"
+        else
+            log_item "run" "Node.js runtime for Gemini patch"
+            if update_ensure_gemini_patch_node; then
+                log_item "fix" "Node.js runtime for Gemini patch" "installed nvm + latest Node.js"
+            else
+                log_item "warn" "Node.js runtime for Gemini patch" "failed to install nvm + latest Node.js; skipping Gemini patch"
+                gemini_patch_ready=false
+                gemini_patch_skip_reason="Node.js runtime unavailable"
+            fi
+        fi
+        if [[ "$gemini_patch_ready" == "true" ]] && ! gemini_nvm_bin="$(update_nvm_node_bin_dir)"; then
+            log_item "warn" "Node.js runtime for Gemini patch" "nvm Node.js bin not found; skipping Gemini patch"
+            gemini_patch_ready=false
+            gemini_patch_skip_reason="Node.js runtime unavailable"
+        fi
+        if [[ "$gemini_patch_ready" == "true" ]]; then
+            run_cmd "Gemini CLI patches" update_run_verified_installer_with_env gemini_patch "PATH=$gemini_nvm_bin:$PATH"
+        else
+            log_item "skip" "Gemini CLI patches" "$gemini_patch_skip_reason"
+        fi
+    else
+        log_item "skip" "Gemini CLI" "not installed (use --force to install)"
+    fi
+}
+
+# Run update_run_verified_installer for Claude with a bounded timeout.
+# Uses a background-process approach so that shell functions remain available.
+# Returns 124 on timeout (matching timeout(1) convention).
+_run_claude_installer_with_timeout() {
+    local seconds="${1:-300}"
+    update_run_verified_installer claude latest &
+    local pid=$!
+    local elapsed=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [[ $elapsed -ge $seconds ]]; then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$pid"
+}
+
+# Helper for Claude update with proper error handling
+# FIX(bd-gsjqf.2): Replaced bare "claude update --channel latest" (flag does not exist)
+# with update_run_verified_installer which uses the official install.sh script.
+# See: https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup/issues/125
+run_cmd_claude_update() {
+    local desc="Claude Code (verified installer)"
+    local cmd_display="update_run_verified_installer claude latest"
+    local claude_installer_timeout="${CLAUDE_INSTALLER_TIMEOUT:-300}"
+
+    log_to_file "Running: $cmd_display (timeout: ${claude_installer_timeout}s)"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_item "skip" "$desc" "dry-run: $cmd_display"
+        return 0
+    fi
+
+    log_item "run" "$desc"
+
+    local exit_code=0
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        if [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+            {
+                echo ""
+                echo "----- COMMAND: $cmd_display (timeout: ${claude_installer_timeout}s)"
+            } >> "$UPDATE_LOG_FILE"
+        fi
+
+        if [[ "$QUIET" != "true" ]] && [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+            if _run_claude_installer_with_timeout "$claude_installer_timeout" 2>&1 | tee -a "$UPDATE_LOG_FILE"; then
+                exit_code=0
+            else
+                exit_code=${PIPESTATUS[0]}
+            fi
+        elif [[ -n "${UPDATE_LOG_FILE:-}" ]]; then
+            if _run_claude_installer_with_timeout "$claude_installer_timeout" >> "$UPDATE_LOG_FILE" 2>&1; then
+                exit_code=0
+            else
+                exit_code=$?
+            fi
+        else
+            if [[ "$QUIET" != "true" ]]; then
+                _run_claude_installer_with_timeout "$claude_installer_timeout" || exit_code=$?
+            else
+                _run_claude_installer_with_timeout "$claude_installer_timeout" >/dev/null 2>&1 || exit_code=$?
+            fi
+        fi
+    else
+        local output=""
+        output=$(_run_claude_installer_with_timeout "$claude_installer_timeout" 2>&1) || exit_code=$?
+        [[ -n "$output" ]] && log_to_file "Output: $output"
+    fi
+
+    # Detect timeout specifically (exit code 124 from timeout(1))
+    if [[ $exit_code -eq 124 ]]; then
+        log_to_file "TIMEOUT: Claude installer exceeded ${claude_installer_timeout}s limit"
+        if [[ "$QUIET" != "true" ]]; then
+            echo -e "  ${YELLOW}[timeout]${NC} $desc (exceeded ${claude_installer_timeout}s)"
+        fi
+        return 1
+    fi
+
+    if [[ $exit_code -eq 0 ]]; then
+        if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+            echo -e "\033[1A\033[2K  ${GREEN}[ok]${NC} $desc"
+        elif [[ "$QUIET" != "true" ]]; then
+            echo -e "  ${GREEN}[ok]${NC} $desc"
+        fi
+        log_to_file "Success: $desc"
+        ((SUCCESS_COUNT += 1))
+        return 0
+    else
+        if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+            echo -e "\033[1A\033[2K  ${YELLOW}[retry]${NC} $desc"
+        elif [[ "$QUIET" != "true" ]]; then
+            echo -e "  ${YELLOW}[retry]${NC} $desc"
+        fi
+        log_to_file "Failed: $desc (exit code: $exit_code), will try reinstall"
+        return 1
+    fi
+}
+
+supabase_release_update_script() {
+    cat <<'EOF'
+set -euo pipefail
+
+CURL_ARGS=(--connect-timeout 30 --max-time 300 -fsSL)
+if command -v curl &>/dev/null && curl --help all 2>/dev/null | grep -q -- '--proto'; then
+  CURL_ARGS=(--proto '=https' --proto-redir '=https' --connect-timeout 30 --max-time 300 -fsSL)
+fi
+
+arch=""
+case "$(uname -m)" in
+  x86_64) arch="amd64" ;;
+  aarch64|arm64) arch="arm64" ;;
+  *)
+    echo "Supabase CLI: unsupported architecture ($(uname -m))" >&2
+    exit 1
+    ;;
+esac
+
+release_url="$(curl "${CURL_ARGS[@]}" -o /dev/null -w '%{url_effective}\n' "https://github.com/supabase/cli/releases/latest" 2>/dev/null | tail -n1)" || true
+tag="${release_url##*/}"
+if [[ -z "$tag" ]] || [[ "$tag" != v* ]]; then
+  echo "Supabase CLI: failed to resolve latest release tag" >&2
+  exit 1
+fi
+
+version="${tag#v}"
+base_url="https://github.com/supabase/cli/releases/download/${tag}"
+tarball="supabase_linux_${arch}.tar.gz"
+checksums="supabase_${version}_checksums.txt"
+
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/acfs-supabase.XXXXXX" 2>/dev/null)" || tmp_dir=""
+tmp_tgz="$(mktemp "${TMPDIR:-/tmp}/acfs-supabase.tgz.XXXXXX" 2>/dev/null)" || tmp_tgz=""
+tmp_checksums="$(mktemp "${TMPDIR:-/tmp}/acfs-supabase.sha.XXXXXX" 2>/dev/null)" || tmp_checksums=""
+extracted_bin=""
+
+if [[ -z "$tmp_dir" ]] || [[ -z "$tmp_tgz" ]] || [[ -z "$tmp_checksums" ]]; then
+  echo "Supabase CLI: failed to create temp files" >&2
+  exit 1
+fi
+
+cleanup() {
+  [[ -n "${tmp_tgz:-}" ]] && rm -f "$tmp_tgz" 2>/dev/null || true
+  [[ -n "${tmp_checksums:-}" ]] && rm -f "$tmp_checksums" 2>/dev/null || true
+  [[ -n "${extracted_bin:-}" ]] && rm -f "$extracted_bin" 2>/dev/null || true
+  if [[ -n "${tmp_dir:-}" ]] && [[ -d "$tmp_dir" ]]; then
+    find "$tmp_dir" -type f -delete 2>/dev/null || true
+    find "$tmp_dir" -depth -type d -empty -delete 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+if ! curl "${CURL_ARGS[@]}" -o "$tmp_tgz" "${base_url}/${tarball}" 2>/dev/null; then
+  echo "Supabase CLI: failed to download ${tarball}" >&2
+  exit 1
+fi
+if ! curl "${CURL_ARGS[@]}" -o "$tmp_checksums" "${base_url}/${checksums}" 2>/dev/null; then
+  echo "Supabase CLI: failed to download checksums" >&2
+  exit 1
+fi
+
+expected_sha="$(awk -v tb="$tarball" '$2 == tb {print $1; exit}' "$tmp_checksums" 2>/dev/null)"
+if [[ -z "$expected_sha" ]]; then
+  echo "Supabase CLI: checksum entry not found for ${tarball}" >&2
+  exit 1
+fi
+
+actual_sha=""
+if command -v sha256sum &>/dev/null; then
+  actual_sha="$(sha256sum "$tmp_tgz" | awk '{print $1}')"
+elif command -v shasum &>/dev/null; then
+  actual_sha="$(shasum -a 256 "$tmp_tgz" | awk '{print $1}')"
+else
+  echo "Supabase CLI: no SHA256 tool available (need sha256sum or shasum)" >&2
+  exit 1
+fi
+
+if [[ -z "$actual_sha" ]] || [[ "$actual_sha" != "$expected_sha" ]]; then
+  echo "Supabase CLI: checksum mismatch" >&2
+  echo "  Expected: $expected_sha" >&2
+  echo "  Actual:   ${actual_sha:-<missing>}" >&2
+  exit 1
+fi
+
+if ! tar -xzf "$tmp_tgz" -C "$tmp_dir" --no-same-owner --no-same-permissions supabase 2>/dev/null; then
+  tar -xzf "$tmp_tgz" -C "$tmp_dir" --no-same-owner --no-same-permissions 2>/dev/null || {
+    echo "Supabase CLI: failed to extract tarball" >&2
+    exit 1
+  }
+fi
+
+extracted_bin="$tmp_dir/supabase"
+if [[ ! -f "$extracted_bin" ]]; then
+  extracted_bin="$(find "$tmp_dir" -maxdepth 2 -type f -name supabase -print -quit 2>/dev/null || true)"
+fi
+if [[ -z "$extracted_bin" ]] || [[ ! -f "$extracted_bin" ]]; then
+  echo "Supabase CLI: binary not found after extract" >&2
+  exit 1
+fi
+
+mkdir -p "${ACFS_BIN_DIR:-$HOME/.local/bin}"
+install -m 0755 "$extracted_bin" "${ACFS_BIN_DIR:-$HOME/.local/bin}/supabase"
+
+if command -v timeout &>/dev/null; then
+  timeout 5 "${ACFS_BIN_DIR:-$HOME/.local/bin}/supabase" --version >/dev/null 2>&1 || {
+    echo "Supabase CLI: installed but failed to run" >&2
+    exit 1
+  }
+else
+  "${ACFS_BIN_DIR:-$HOME/.local/bin}/supabase" --version >/dev/null 2>&1 || {
+    echo "Supabase CLI: installed but failed to run" >&2
+    exit 1
+  }
+fi
+EOF
+}
+
+update_cloud() {
+    if [[ "$UPDATE_CLOUD" != "true" ]]; then
+        return 0
+    fi
+
+    log_section "Cloud CLIs"
+
+    local bun_bin="$HOME/.bun/bin/bun"
+    local has_bun=false
+    [[ -x "$bun_bin" ]] && has_bun=true
+
+    # Wrangler (--trust allows postinstall scripts for native binaries)
+    if cmd_exists wrangler || [[ "$FORCE_MODE" == "true" ]]; then
+        if [[ "$has_bun" == "true" ]]; then
+            run_cmd_bun_with_retry "Wrangler (Cloudflare)" "$bun_bin" install -g --trust wrangler@latest
+        else
+            log_item "fail" "Wrangler (Cloudflare)" "bun not installed (required)"
+        fi
+    else
+        log_item "skip" "Wrangler" "not installed"
+    fi
+
+    # Supabase (verified GitHub release binary; installed to ~/.local/bin)
+    if cmd_exists supabase || [[ "$FORCE_MODE" == "true" ]]; then
+        capture_version_before "supabase"
+        run_cmd "Supabase CLI" bash -c "$(supabase_release_update_script)"
+        # Refresh PATH in case ~/.local/bin was created during install.
+        ensure_path
+        if capture_version_after "supabase"; then
+            [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[supabase]}" "${VERSION_AFTER[supabase]}"
+        fi
+    else
+        log_item "skip" "Supabase CLI" "not installed"
+    fi
+
+    # Vercel (--trust allows postinstall scripts for native binaries)
+    if cmd_exists vercel || [[ "$FORCE_MODE" == "true" ]]; then
+        if [[ "$has_bun" == "true" ]]; then
+            run_cmd_bun_with_retry "Vercel CLI" "$bun_bin" install -g --trust vercel@latest
+        else
+            log_item "fail" "Vercel CLI" "bun not installed (required)"
+        fi
+    else
+        log_item "skip" "Vercel CLI" "not installed"
+    fi
+
+    # GitHub CLI (gh) - update extensions
+    if cmd_exists gh; then
+        capture_version_before "gh"
+        # Update gh extensions if any are installed
+        local gh_extensions=0
+        gh_extensions=$(gh extension list 2>/dev/null | grep -v "no installed extensions found" | grep -c -v "No extensions installed" || true)
+        gh_extensions=$((gh_extensions + 0))  # Strip whitespace, ensure integer
+        if [[ $gh_extensions -gt 0 ]]; then
+            run_cmd "GitHub CLI extensions" gh extension upgrade --all
+        else
+            log_item "ok" "GitHub CLI" "no extensions to update"
+        fi
+        # gh itself is updated via apt, log current version
+        if capture_version_after "gh"; then
+            [[ "$QUIET" != "true" ]] && printf "       ${DIM}version: %s${NC}\n" "${VERSION_AFTER[gh]}"
+        fi
+    else
+        log_item "skip" "GitHub CLI" "not installed"
+    fi
+
+    # Google Cloud SDK (gcloud)
+    if cmd_exists gcloud; then
+        if dpkg -s google-cloud-cli >/dev/null 2>&1; then
+            # apt-managed installs disable `gcloud components update`;
+            # the package is updated via apt-get instead.
+            log_item "ok" "Google Cloud SDK" "apt-managed (update via apt-get upgrade)"
+            log_to_file "gcloud is apt-managed; components update disabled by Google. Update with: sudo apt-get install -y --only-upgrade google-cloud-cli"
+        else
+            capture_version_before "gcloud"
+            # gcloud components update requires --quiet for non-interactive
+            run_cmd "Google Cloud SDK" gcloud components update --quiet
+            if capture_version_after "gcloud"; then
+                [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[gcloud]}" "${VERSION_AFTER[gcloud]}"
+            fi
+        fi
+    else
+        log_item "skip" "Google Cloud SDK" "not installed"
+    fi
+}
+
+update_rust() {
+    if [[ "$UPDATE_RUNTIME" != "true" ]]; then
+        return 0
+    fi
+
+    log_section "Rust Toolchain"
+
+    local rustup_bin="$HOME/.cargo/bin/rustup"
+
+    if [[ ! -x "$rustup_bin" ]]; then
+        log_item "skip" "Rust" "not installed"
+        return 0
+    fi
+
+    # Capture version before update
+    capture_version_before "rust"
+
+    # Update stable toolchain
+    run_cmd "Rust stable" "$rustup_bin" update stable
+
+    # Check if nightly is installed and update it too
+    if "$rustup_bin" toolchain list 2>/dev/null | grep -q "^nightly"; then
+        run_cmd "Rust nightly" "$rustup_bin" update nightly
+    fi
+
+    # Update rustup itself
+    run_cmd "rustup self-update" "$rustup_bin" self update
+
+    # Show version change without double-counting
+    if capture_version_after "rust"; then
+        [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[rust]}" "${VERSION_AFTER[rust]}"
+    fi
+
+    # Log installed toolchains
+    local toolchains
+    toolchains=$("$rustup_bin" toolchain list 2>/dev/null | tr '\n' ', ' | sed 's/, $//')
+    log_to_file "Installed toolchains: $toolchains"
+}
+
+update_cargo_tools() {
+    if [[ "$UPDATE_RUNTIME" != "true" ]]; then
+        return 0
+    fi
+
+    log_section "Cargo Tools"
+
+    local cargo_bin="$HOME/.cargo/bin/cargo"
+    if [[ ! -x "$cargo_bin" ]]; then
+        log_item "skip" "Cargo tools" "cargo not found"
+        return 0
+    fi
+
+    # Tools to update via cargo install
+    # Format: package_name|binary_name
+    local tools=("ast-grep|sg" "lsd|lsd" "du-dust|dust" "tealdeer|tldr")
+
+    for entry in "${tools[@]}"; do
+        local tool="${entry%|*}"
+        local binary_name="${entry#*|}"
+
+        if ! command -v "$binary_name" &>/dev/null && [[ ! -x "$HOME/.cargo/bin/$binary_name" ]]; then
+            continue
+        fi
+
+        capture_version_before "$binary_name"
+        
+        # force is required to update existing install with cargo
+        # Use run_cmd to log and handle errors
+        run_cmd "Update $tool" "$cargo_bin" install "$tool" --locked --force
+
+        if capture_version_after "$binary_name"; then
+             [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[$binary_name]}" "${VERSION_AFTER[$binary_name]}"
+        fi
+    done
+}
+
+update_uv() {
+    if [[ "$UPDATE_RUNTIME" != "true" ]]; then
+        return 0
+    fi
+
+    log_section "Python Tools (uv)"
+
+    local uv_bin="${ACFS_BIN_DIR:-$HOME/.local/bin}/uv"
+
+    if [[ ! -x "$uv_bin" ]]; then
+        log_item "skip" "uv" "not installed"
+        return 0
+    fi
+
+    # Capture version before update
+    capture_version_before "uv"
+
+    run_cmd "uv self-update" "$uv_bin" self update
+
+    # Show version change without double-counting
+    if capture_version_after "uv"; then
+        [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[uv]}" "${VERSION_AFTER[uv]}"
+    fi
+}
+
+update_go() {
+    if [[ "$UPDATE_RUNTIME" != "true" ]]; then
+        return 0
+    fi
+
+    log_section "Go Runtime"
+
+    # Check if go is installed
+    if ! command -v go &>/dev/null; then
+        log_item "skip" "Go" "not installed"
+        return 0
+    fi
+
+    # Determine how Go was installed
+    local go_path
+    go_path=$(command -v go 2>/dev/null || true)
+
+    # Check if it's apt-managed (system install)
+    if [[ "$go_path" == "/usr/bin/go" ]] || [[ "$go_path" == "/usr/local/go/bin/go" ]]; then
+        # System install - apt handles it, or manual install
+        if dpkg -l golang-go &>/dev/null 2>&1; then
+            log_item "ok" "Go" "apt-managed (updated via apt upgrade)"
+            log_to_file "Go is managed by apt, skipping dedicated update"
+        else
+            log_item "skip" "Go" "manual install, update manually from golang.org"
+            log_to_file "Go appears to be manually installed at $go_path"
+        fi
+        return 0
+    fi
+
+    # Check for goenv or similar version managers
+    if [[ -d "$HOME/.goenv" ]]; then
+        log_item "skip" "Go" "managed by goenv, use goenv to update"
+        return 0
+    fi
+
+    # For other installations, just log the version
+    local go_version
+    go_version=$(go version 2>/dev/null | awk '{print $3}' | sed 's/go//')
+    log_item "ok" "Go $go_version" "no auto-update available"
+    log_to_file "Go version: $go_version (path: $go_path)"
+}
+
+update_stack() {
+    if [[ "$UPDATE_STACK" != "true" ]]; then
+        return 0
+    fi
+
+    log_section "Dicklesworthstone Stack"
+
+    if ! update_require_security; then
+        log_item "fail" "stack updates" "security verification unavailable (missing security.sh/checksums.yaml)"
+        return 0
+    fi
+
+    # Brenner Bot - skip all toolchain deps (NTM, CASS, CM) because ACFS
+    # installs/updates them individually below.  Previously only --skip-cass
+    # was passed, causing brenner's install_toolchain() to redundantly rebuild
+    # NTM and CM from source — a 5+ hour hang on slow machines (fixes #210).
+    capture_version_before "brenner"
+    run_cmd "Brenner Bot" update_run_verified_installer brenner_bot --skip-ntm --skip-cass --skip-cm
+    if capture_version_after "brenner"; then
+        [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[brenner]}" "${VERSION_AFTER[brenner]}"
+    fi
+
+    # NTM - always install/update (installer is idempotent)
+    capture_version_before "ntm"
+    run_cmd "NTM" update_run_verified_installer ntm
+    if capture_version_after "ntm"; then
+        [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[ntm]}" "${VERSION_AFTER[ntm]}"
+    fi
+
+    # MCP Agent Mail - always install/update via non-blocking installer mode,
+    # then enable the managed user service on port 8765.
+    local tool="mcp_agent_mail"
+    local tmp_file=""  # guard against verify_checksum RETURN trap leak
+    local url="${KNOWN_INSTALLERS[$tool]:-}"
+    local expected_sha256
+    expected_sha256="$(get_checksum "$tool")"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_item "skip" "MCP Agent Mail" "dry-run: verified install + service refresh"
+    elif [[ -n "$url" ]] && [[ -n "$expected_sha256" ]]; then
+        local tmp_install
+        tmp_install=$(mktemp "${TMPDIR:-/tmp}/acfs-install-am.XXXXXX" 2>/dev/null) || tmp_install=""
+        if [[ -z "$tmp_install" ]]; then
+            log_item "fail" "MCP Agent Mail" "failed to create temp file for verified installer"
+        else
+            if verify_checksum "$url" "$expected_sha256" "$tool" > "$tmp_install"; then
+                chmod +x "$tmp_install"
+                log_item "run" "MCP Agent Mail"
+
+                # Use --dest and exact target dir just like the manifest
+                local target_user=""
+                local target_home=""
+                target_user="$(update_target_user)"
+                target_home="$(update_target_home "$target_user")"
+
+                if update_run_in_target_context "" bash "$tmp_install" --dest "$target_home/mcp_agent_mail" --yes; then
+                    if update_source_stack_lib; then
+                        TARGET_USER="$target_user" TARGET_HOME="$target_home" _stack_repair_agent_mail_cli_symlink >/dev/null 2>&1 || true
+                    fi
+                    if update_source_stack_lib && \
+                       TARGET_USER="$target_user" TARGET_HOME="$target_home" _stack_configure_agent_mail_service && \
+                       TARGET_USER="$target_user" TARGET_HOME="$target_home" _stack_wait_for_agent_mail_health; then
+                        if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+                            printf "\033[1A\033[2K  ${GREEN}[ok]${NC} %s\n" "MCP Agent Mail"
+                        elif [[ "$QUIET" != "true" ]]; then
+                            printf "  ${GREEN}[ok]${NC} %s\n" "MCP Agent Mail"
+                        fi
+                        log_to_file "Success: MCP Agent Mail"
+                        ((SUCCESS_COUNT += 1))
+                    else
+                        if [[ "$QUIET" != "true" ]] && [[ "$VERBOSE" != "true" ]]; then
+                            printf "\033[1A\033[2K  ${RED}[FAIL]${NC} %s\n" "MCP Agent Mail"
+                        elif [[ "$QUIET" != "true" ]]; then
+                            printf "  ${RED}[FAIL]${NC} %s\n" "MCP Agent Mail"
+                        fi
+                        log_to_file "Failed: MCP Agent Mail - service setup/readiness failed"
+                        ((FAIL_COUNT += 1))
+                    fi
+                else
+                    log_item "fail" "MCP Agent Mail" "installer failed"
+                fi
+
+                rm -f "$tmp_install" 2>/dev/null || true
+            else
+                rm -f "$tmp_install"
+                log_item "fail" "MCP Agent Mail" "verification failed"
+            fi
+        fi
+    else
+        log_item "fail" "MCP Agent Mail" "unknown installer URL/checksum"
+    fi
+
+    # Meta Skill (ms) - always install/update (installer is idempotent)
+    run_cmd "Meta Skill" update_run_verified_installer ms --easy-mode
+
+    # APR (Automated Plan Reviser Pro) - always install/update
+    run_cmd "APR" update_run_verified_installer apr --easy-mode
+
+    # Process Triage (pt) - always install/update
+    run_cmd "Process Triage" update_run_verified_installer pt
+
+    # xf (X Archive Search) - always install/update
+    run_cmd "xf" update_run_verified_installer xf --easy-mode
+
+    # JeffreysPrompts (jfp) - only update if already installed
+    # Note: JFP requires a paid subscription to jeffreysprompts.com
+    if cmd_exists jfp; then
+        run_cmd "JeffreysPrompts" update_run_verified_installer jfp
+    fi
+
+    # UBS - always install/update (installer is idempotent)
+    run_cmd "Ultimate Bug Scanner" update_run_verified_installer ubs --easy-mode
+
+    # Beads Viewer - always install/update
+    run_cmd "Beads Viewer" update_run_verified_installer bv
+
+    # Beads Rust (br) - local issue tracker CLI - always install/update
+    run_cmd "Beads Rust" update_run_verified_installer br
+
+    # CASS - always install/update
+    run_cmd "CASS" update_run_verified_installer cass --easy-mode --verify
+
+    # CASS Memory - always install/update
+    run_cmd "CASS Memory" update_run_verified_installer cm --easy-mode --verify
+
+    # CAAM - always install/update
+    run_cmd "CAAM" update_run_verified_installer caam
+
+    # SLB - always install/update (must build from source due to upstream installer bug)
+    run_cmd "SLB" update_run_slb_source_install
+
+    # RU (Repo Updater) - always install/update
+    run_cmd "RU" update_run_verified_installer_with_env ru "RU_NON_INTERACTIVE=1"
+
+    # DCG (Destructive Command Guard) - always install/update
+    run_cmd "DCG" update_run_verified_installer dcg --easy-mode
+    # Re-register hook after install/update to ensure latest version is active
+    if cmd_exists dcg && cmd_exists claude; then
+        run_cmd "DCG Hook" dcg install --force 2>/dev/null || true
+    fi
+
+    # RCH (Remote Compilation Helper) - always install/update
+    run_cmd "RCH" update_run_verified_installer rch
+
+    # GIIL (Google Image Inline Linker) - always install/update
+    run_cmd "GIIL" update_run_verified_installer giil
+
+    # CSCTF (Chat Shared Conversation To File) - always install/update
+    run_cmd "CSCTF" update_run_verified_installer csctf
+
+    # SRPS (System Resource Protection Script) - always install/update
+    run_cmd "SRPS" update_run_verified_installer srps
+
+    # TRU (Toon Rust) - always install/update
+    run_cmd "TRU" update_run_verified_installer tru
+
+    # RANO - always install/update
+    run_cmd "RANO" update_run_verified_installer rano
+
+    # MDWB (Markdown Web Browser) - always install/update
+    run_cmd "MDWB" update_run_verified_installer mdwb --yes
+
+    # S2P (Source to Prompt TUI) - always install/update
+    run_cmd "S2P" update_run_verified_installer s2p -- --skip-cass
+
+    # FrankenSearch (fsfs) - always install/update
+    run_cmd "FrankenSearch" update_run_verified_installer fsfs --easy-mode
+
+    # Storage Ballast Helper (sbh) - always install/update
+    run_cmd "SBH" update_run_verified_installer sbh
+
+    # Cross-Agent Session Resumer (casr) - always install/update
+    run_cmd "CASR" update_run_verified_installer casr
+
+    # ASCII Art Diagram Corrector (aadc) - update when installed, or install with --force
+    if cmd_exists aadc || [[ "$FORCE_MODE" == "true" ]]; then
+        capture_version_before "aadc"
+        run_cmd "AADC" bash -c 'ACFS_TMP_DIR="$(mktemp -d)"; trap "[ -n \\\"$ACFS_TMP_DIR\\\" ] && rm -rf \\\"$ACFS_TMP_DIR\\\"" EXIT; git clone --depth 1 https://github.com/Dicklesworthstone/aadc.git "$ACFS_TMP_DIR/aadc" && cd "$ACFS_TMP_DIR/aadc" && cargo build --release && cp target/release/aadc ~/.cargo/bin/'
+        capture_version_after "aadc"
+    fi
+
+    # Rust Proxy (rust_proxy) - update when installed, or install with --force
+    if cmd_exists rust_proxy || [[ "$FORCE_MODE" == "true" ]]; then
+        capture_version_before "rust_proxy"
+        run_cmd "Rust Proxy" bash -c 'ACFS_TMP_DIR="$(mktemp -d)"; trap "[ -n \\\"$ACFS_TMP_DIR\\\" ] && rm -rf \\\"$ACFS_TMP_DIR\\\"" EXIT; git clone --depth 1 https://github.com/Dicklesworthstone/rust_proxy.git "$ACFS_TMP_DIR/rust_proxy" && cd "$ACFS_TMP_DIR/rust_proxy" && cargo build --release && cp target/release/rust_proxy ~/.cargo/bin/'
+        capture_version_after "rust_proxy"
+    fi
+
+    # Agent Settings Backup (asb) - update when installed, or install with --force
+    if cmd_exists asb || [[ "$FORCE_MODE" == "true" ]]; then
+        capture_version_before "asb"
+        run_cmd "ASB" update_run_verified_installer asb
+        if capture_version_after "asb"; then
+            [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[asb]}" "${VERSION_AFTER[asb]}"
+        else
+            log_to_file "ASB already up to date: ${VERSION_AFTER[asb]:-${VERSION_BEFORE[asb]:-unknown}}"
+        fi
+    fi
+
+    # Post-Compact Reminder (pcr) - only update when Claude Code is installed
+    local pcr_hook_script="${ACFS_BIN_DIR:-$HOME/.local/bin}/claude-post-compact-reminder"
+    if ! cmd_exists claude; then
+        log_item "skip" "PCR" "Claude Code not installed"
+    elif [[ -x "$pcr_hook_script" || "$FORCE_MODE" == "true" ]]; then
+        local pcr_mtime_before=""
+        local pcr_mtime_after=""
+        pcr_mtime_before="$(get_file_mtime "$pcr_hook_script" 2>/dev/null || true)"
+        if [[ -n "$pcr_mtime_before" ]]; then
+            log_to_file "PCR hook mtime before: $pcr_mtime_before ($pcr_hook_script)"
+        else
+            log_to_file "PCR hook mtime before: missing ($pcr_hook_script)"
+        fi
+
+        run_cmd "PCR" update_run_verified_installer pcr --update
+
+        pcr_mtime_after="$(get_file_mtime "$pcr_hook_script" 2>/dev/null || true)"
+        if [[ -n "$pcr_mtime_after" ]]; then
+            log_to_file "PCR hook mtime after: $pcr_mtime_after ($pcr_hook_script)"
+        else
+            log_to_file "PCR hook mtime after: missing ($pcr_hook_script)"
+        fi
+
+        if [[ -n "$pcr_mtime_before" && -n "$pcr_mtime_after" && "$pcr_mtime_before" != "$pcr_mtime_after" ]]; then
+            [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "$pcr_mtime_before" "$pcr_mtime_after"
+        elif [[ -n "$pcr_mtime_after" ]]; then
+            log_to_file "PCR hook already up to date: mtime unchanged ($pcr_mtime_after)"
+        fi
+    else
+        log_item "skip" "PCR" "not installed (use --force to install)"
+    fi
+
+    # DSR (Doodlestein Self-Releaser) - always install/update
+    run_cmd "DSR" update_run_verified_installer dsr --easy-mode
+}
+
+# ============================================================
+# Root AGENTS.md Generation
+# ============================================================
+update_root_agents_md() {
+    log_section "Root AGENTS.md"
+
+    if ! cmd_exists flywheel-update-agents-md; then
+        local generator=""
+        local candidate=""
+        local -a security_candidates=(
+            "${ACFS_BIN_DIR:-$HOME/.local/bin}/flywheel-update-agents-md"
+            "${ACFS_HOME:-$HOME/.acfs}/bin/flywheel-update-agents-md"
+        )
+        if [[ -n "${ACFS_REPO_ROOT:-}" ]]; then
+            security_candidates+=("${ACFS_REPO_ROOT}/scripts/generate-root-agents-md.sh")
+        fi
+
+        for candidate in "${security_candidates[@]}"; do
+            if [[ -n "$candidate" ]] && [[ -f "$candidate" ]]; then
+                generator="$candidate"
+                break
+            fi
+        done
+
+        if [[ -f "$generator" ]]; then
+            if ! run_cmd_sudo "Install flywheel-update-agents-md" ln -sf "$generator" /usr/local/bin/flywheel-update-agents-md; then
+                log_item "skip" "Root AGENTS.md" "flywheel-update-agents-md not installed"
+                return 0
+            fi
+        else
+            log_item "skip" "Root AGENTS.md" "flywheel-update-agents-md not installed"
+            return 0
+        fi
+    fi
+
+    run_cmd_sudo "Root AGENTS.md" flywheel-update-agents-md
+}
+
+# ============================================================
+# Shell Tool Updates
+# Related: bead db0
+# ============================================================
+
+# Update Oh-My-Zsh via its built-in upgrade script
+update_omz() {
+    local omz_dir="${ZSH:-$HOME/.oh-my-zsh}"
+
+    if [[ ! -d "$omz_dir" ]]; then
+        log_item "skip" "Oh-My-Zsh" "not installed"
+        return 0
+    fi
+
+    capture_version_before "omz"
+
+    # OMZ has its own upgrade script that handles everything
+    # Set DISABLE_UPDATE_PROMPT to avoid interactive prompts
+    local upgrade_script="$omz_dir/tools/upgrade.sh"
+    if [[ -x "$upgrade_script" ]]; then
+        run_cmd "Oh-My-Zsh upgrade" timeout 120 env DISABLE_UPDATE_PROMPT=true ZSH="$omz_dir" "$upgrade_script"
+    elif [[ -f "$upgrade_script" ]]; then
+        run_cmd "Oh-My-Zsh upgrade" timeout 120 env DISABLE_UPDATE_PROMPT=true ZSH="$omz_dir" bash "$upgrade_script"
+    else
+        # Fallback to git pull
+        if [[ -d "$omz_dir/.git" ]]; then
+            run_cmd "Oh-My-Zsh (git pull)" timeout 60 git -C "$omz_dir" pull --ff-only
+        else
+            log_item "skip" "Oh-My-Zsh" "no upgrade mechanism found"
+            return 0
+        fi
+    fi
+
+    # Show version change without double-counting
+    if capture_version_after "omz"; then
+        [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[omz]}" "${VERSION_AFTER[omz]}"
+    fi
+}
+
+# Update Powerlevel10k theme via git
+update_p10k() {
+    local p10k_dir="${ZSH_CUSTOM:-${ZSH:-$HOME/.oh-my-zsh}/custom}/themes/powerlevel10k"
+
+    if [[ ! -d "$p10k_dir" ]]; then
+        log_item "skip" "Powerlevel10k" "not installed"
+        return 0
+    fi
+
+    if [[ ! -d "$p10k_dir/.git" ]]; then
+        log_item "skip" "Powerlevel10k" "not a git repo"
+        return 0
+    fi
+
+    capture_version_before "p10k"
+
+    # Use --ff-only to avoid merge conflicts
+    local output=""
+    local exit_code=0
+    output=$(timeout 60 git -C "$p10k_dir" pull --ff-only 2>&1) || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        if ! echo "$output" | grep -q "Already up to date"; then
+            if capture_version_after "p10k"; then
+                log_item "ok" "Powerlevel10k updated" "${VERSION_BEFORE[p10k]} → ${VERSION_AFTER[p10k]}"
+            else
+                log_item "ok" "Powerlevel10k updated" "(version unchanged)"
+            fi
+        else
+            log_item "ok" "Powerlevel10k" "already up to date"
+        fi
+    else
+        # Check if it's a ff-only failure (local changes)
+        if echo "$output" | grep -q "fatal.*not possible to fast-forward"; then
+            log_item "skip" "Powerlevel10k" "local changes detected, manual merge required"
+            log_to_file "P10K update failed: $output"
+        else
+            log_item "fail" "Powerlevel10k" "git pull failed"
+            log_to_file "P10K update failed: $output"
+            # Note: log_item "fail" already increments FAIL_COUNT
+        fi
+    fi
+}
+
+# Update zsh plugins via git
+update_zsh_plugins() {
+    local zsh_custom="${ZSH_CUSTOM:-${ZSH:-$HOME/.oh-my-zsh}/custom}"
+    local plugins_dir="$zsh_custom/plugins"
+
+    # Known plugins to update
+    local -a plugins=(
+        "zsh-autosuggestions"
+        "zsh-syntax-highlighting"
+        "zsh-completions"
+        "zsh-history-substring-search"
+    )
+
+    local updated=0
+    local skipped=0
+
+    for plugin in "${plugins[@]}"; do
+        local plugin_dir="$plugins_dir/$plugin"
+
+        if [[ ! -d "$plugin_dir" ]]; then
+            continue
+        fi
+
+        if [[ ! -d "$plugin_dir/.git" ]]; then
+            log_item "warn" "$plugin" "not a git repo (skipped)"
+            log_to_file "Plugin $plugin exists but is not a git repo"
+            continue
+        fi
+
+        local output=""
+        local exit_code=0
+        output=$(timeout 60 git -C "$plugin_dir" pull --ff-only 2>&1) || exit_code=$?
+
+        if [[ $exit_code -eq 0 ]]; then
+            if ! echo "$output" | grep -q "Already up to date"; then
+                log_item "ok" "$plugin" "updated"
+                ((updated += 1))
+            else
+                ((skipped += 1))
+            fi
+        else
+            if echo "$output" | grep -q "fatal.*not possible to fast-forward"; then
+                log_item "skip" "$plugin" "local changes"
+            else
+                log_item "fail" "$plugin" "git pull failed"
+                log_to_file "$plugin update failed: $output"
+            fi
+        fi
+    done
+
+    if [[ $updated -eq 0 && $skipped -gt 0 ]]; then
+        log_item "ok" "zsh plugins" "$skipped plugins already up to date"
+    elif [[ $updated -eq 0 && $skipped -eq 0 ]]; then
+        log_item "skip" "zsh plugins" "no plugins installed"
+    fi
+}
+
+# Update Atuin - try self-update first, fallback to installer
+update_atuin() {
+    local atuin_bin=""
+    atuin_bin="$(update_tool_binary_path "atuin" 2>/dev/null || true)"
+    if [[ -z "$atuin_bin" ]]; then
+        log_item "skip" "Atuin" "not installed"
+        return 0
+    fi
+
+    capture_version_before "atuin"
+    local needs_reinstall=false
+
+    # Try atuin self-update first (available in newer versions)
+    if "$atuin_bin" --help 2>&1 | grep -q "self-update"; then
+        if run_cmd_attempt_with_retry "Atuin self-update" "$atuin_bin" self-update; then
+            update_repair_atuin_install >/dev/null 2>&1 || true
+            # If self-update succeeded, check whether version is now current;
+            # skip the heavier reinstall path to avoid a stalling curl download.
+            local ver_after
+            ver_after=$(get_version "atuin")
+            if [[ -n "$ver_after" && "$ver_after" != "unknown" ]]; then
+                log_to_file "Atuin self-update succeeded (version: $ver_after), skipping reinstall"
+            else
+                # self-update ran but we can't determine version — fall through
+                log_to_file "Atuin self-update ran but version check inconclusive, trying reinstall"
+                needs_reinstall=true
+            fi
+        else
+            log_to_file "Atuin self-update failed, trying reinstall"
+            needs_reinstall=true
+        fi
+    else
+        needs_reinstall=true
+    fi
+
+    if [[ "$needs_reinstall" == "true" ]]; then
+        if update_require_security; then
+            if ! update_run_verified_installer_with_shell_repair "Atuin (reinstall)" "atuin" update_repair_atuin_install --non-interactive; then
+                :
+            fi
+        else
+            # Last resort: no checksum verification available
+            if [[ "$YES_MODE" == "true" ]]; then
+                log_item "skip" "Atuin" "checksum verification unavailable (missing security.sh/checksums.yaml)"
+            else
+                log_item "skip" "Atuin" "no self-update command, manual update recommended"
+                local curl_cmd="curl --connect-timeout 30 --max-time 300 -fsSL"
+                if command -v curl &>/dev/null && curl --help all 2>/dev/null | grep -q -- '--proto'; then
+                    curl_cmd="curl --proto '=https' --proto-redir '=https' --connect-timeout 30 --max-time 300 -fsSL"
+                fi
+                log_to_file "Atuin update (manual; review first):"
+                log_to_file "  ${curl_cmd} https://setup.atuin.sh -o /tmp/atuin.install.sh"
+                log_to_file "  sed -n '1,120p' /tmp/atuin.install.sh"
+                log_to_file "  bash /tmp/atuin.install.sh"
+            fi
+            return 0
+        fi
+    fi
+
+    # Show version change without double-counting
+    if capture_version_after "atuin"; then
+        [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[atuin]}" "${VERSION_AFTER[atuin]}"
+    fi
+}
+
+# Update Zoxide via reinstall (checksum verified)
+update_zoxide() {
+    local zoxide_bin=""
+    zoxide_bin="$(update_tool_binary_path "zoxide" 2>/dev/null || true)"
+    if [[ -z "$zoxide_bin" ]]; then
+        log_item "skip" "Zoxide" "not installed"
+        return 0
+    fi
+
+    capture_version_before "zoxide"
+
+    # Zoxide doesn't have self-update, reinstall via official installer
+    if update_require_security; then
+        if ! update_run_verified_installer_with_shell_repair "Zoxide (reinstall)" "zoxide" update_repair_zoxide_install; then
+            :
+        fi
+    else
+        # Last resort: no checksum verification available
+        if [[ "$YES_MODE" == "true" ]]; then
+            log_item "skip" "Zoxide" "checksum verification unavailable (missing security.sh/checksums.yaml)"
+        else
+            log_item "skip" "Zoxide" "no self-update command, manual update recommended"
+            local curl_cmd="curl --connect-timeout 30 --max-time 300 -fsSL"
+            if command -v curl &>/dev/null && curl --help all 2>/dev/null | grep -q -- '--proto'; then
+                curl_cmd="curl --proto '=https' --proto-redir '=https' --connect-timeout 30 --max-time 300 -fsSL"
+            fi
+            log_to_file "Zoxide update (manual; review first):"
+            log_to_file "  ${curl_cmd} https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh -o /tmp/zoxide.install.sh"
+            log_to_file "  sed -n '1,120p' /tmp/zoxide.install.sh"
+            log_to_file "  bash /tmp/zoxide.install.sh"
+        fi
+        return 0
+    fi
+
+    # Show version change without double-counting
+    if capture_version_after "zoxide"; then
+        [[ "$QUIET" != "true" ]] && printf "       ${DIM}%s → %s${NC}\n" "${VERSION_BEFORE[zoxide]}" "${VERSION_AFTER[zoxide]}"
+    fi
+}
+
+# Main shell update dispatcher
+update_shell() {
+    if [[ "$UPDATE_SHELL" != "true" ]]; then
+        return 0
+    fi
+
+    log_section "Shell Tools"
+
+    # Git-based updates (OMZ, P10K, plugins)
+    update_omz
+    update_p10k
+    update_zsh_plugins
+
+    # Installer-based updates (Atuin, Zoxide)
+    update_atuin
+    update_zoxide
+
+    # Keep deployed files in sync with repo (acfs.zshrc, update.sh, etc.)
+    sync_acfs_profile_paths
+    sync_acfs_zprofile_paths
+    sync_acfs_zsh_loader
+    sync_acfs_zshrc
+    sync_acfs_deployed
+    sync_acfs_global_wrapper
+}
+
+# ============================================================
+# Summary
+# ============================================================
+
+print_summary() {
+    # Log footer to file
+    if [[ -n "$UPDATE_LOG_FILE" ]]; then
+        {
+            echo ""
+            echo "==============================================="
+            echo "Summary"
+            echo "==============================================="
+            echo "Updated: $SUCCESS_COUNT"
+            echo "Skipped: $SKIP_COUNT"
+            echo "Failed:  $FAIL_COUNT"
+            if [[ "$REBOOT_REQUIRED" == "true" ]]; then
+                echo "Reboot:  REQUIRED"
+            fi
+            echo ""
+            echo "Completed: $(date -Iseconds)"
+            echo "==============================================="
+        } >> "$UPDATE_LOG_FILE"
+    fi
+
+    # Console output (respects quiet mode for success, always shows failures)
+    if [[ "$QUIET" != "true" ]]; then
+        echo ""
+        echo "============================================================"
+        printf "Summary: ${GREEN}%d updated${NC}, ${DIM}%d skipped${NC}, ${RED}%d failed${NC}\n" "$SUCCESS_COUNT" "$SKIP_COUNT" "$FAIL_COUNT"
+        echo ""
+
+        if [[ $FAIL_COUNT -eq 0 ]]; then
+            printf "${GREEN}All updates completed successfully!${NC}\n"
+        else
+            printf "${YELLOW}Some updates failed. Check output above.${NC}\n"
+        fi
+
+        # Reboot warning
+        if [[ "$REBOOT_REQUIRED" == "true" ]]; then
+            echo ""
+            printf "${YELLOW}${BOLD}⚠ System reboot required${NC}\n"
+            printf "${DIM}Run: sudo reboot${NC}\n"
+        fi
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo ""
+            printf "${DIM}(dry-run mode - no changes were made)${NC}\n"
+        fi
+
+        # Show log location
+        if [[ -n "$UPDATE_LOG_FILE" ]]; then
+            echo ""
+            printf "${DIM}Log: %s${NC}\n" "$UPDATE_LOG_FILE"
+        fi
+    elif [[ $FAIL_COUNT -gt 0 ]]; then
+        # In quiet mode, still report failures
+        echo ""
+        printf "${RED}Update failed: %d error(s)${NC}\n" "$FAIL_COUNT"
+        if [[ -n "$UPDATE_LOG_FILE" ]]; then
+            printf "${DIM}See: %s${NC}\n" "$UPDATE_LOG_FILE"
+        fi
+    fi
+}
+
+# ============================================================
+# CLI
+# ============================================================
+
+usage() {
+    cat << 'EOF'
+acfs update - Update all ACFS components
+
+USAGE:
+  acfs-update [options]
+  acfs update [options]    (if acfs wrapper is installed)
+
+CATEGORY OPTIONS (select what to update):
+  --apt-only         Only update system packages (apt)
+  --agents-only      Only update coding agents (Claude, Codex, Gemini)
+  --cloud-only       Only update cloud CLIs (Wrangler, Supabase, Vercel, gh, gcloud)
+  --shell-only       Only update shell tools (OMZ, P10K, plugins, Atuin, Zoxide)
+  --runtime-only     Only update runtimes (Bun, Rust, uv, Go)
+  --stack-only       Only update Dicklesworthstone stack tools
+  --stack            Include Dicklesworthstone stack tools (enabled by default)
+
+SKIP OPTIONS (exclude categories from update):
+  --no-self-update   Skip ACFS self-update
+  --no-apt           Skip apt update/upgrade
+  --no-agents        Skip coding agent updates
+  --no-cloud         Skip cloud CLI updates
+  --no-shell         Skip shell tool updates
+  --no-runtime       Skip runtime updates (Bun, Rust, uv, Go)
+  --no-stack         Skip Dicklesworthstone stack tool updates
+
+BEHAVIOR OPTIONS:
+  --bootstrap-self-update
+                     Convert a non-git ACFS install into a git checkout before self-update
+  --force            Force reinstallation even if already up to date
+  --dry-run          Preview changes without making them
+  --yes, -y          Non-interactive mode, skip all prompts
+  --quiet, -q        Minimal output, only show errors and summary
+  --verbose, -v      Show detailed output including command details
+  --abort-on-failure Stop immediately on first failure
+  --continue         Continue after failures (default)
+  --help, -h         Show this help message
+
+EXAMPLES:
+  # Standard update (EVERYTHING: apt, runtimes, shell, agents, cloud, stack)
+  acfs-update
+
+  # Skip Dicklesworthstone stack updates (faster)
+  acfs-update --no-stack
+
+  # Only update agents
+  acfs-update --agents-only
+
+  # Only update runtimes
+  acfs-update --runtime-only
+
+  # Only update Dicklesworthstone stack tools
+  acfs-update --stack-only
+
+  # Update everything except apt (faster)
+  acfs-update --no-apt
+
+  # Preview what would be updated
+  acfs-update --dry-run
+
+  # Automated CI/cron mode
+  acfs-update --yes --quiet
+
+  # Explicitly convert a tarball install into a git checkout for self-updates
+  acfs-update --bootstrap-self-update
+
+  # Strict mode: stop on first error
+  acfs-update --abort-on-failure
+
+WHAT EACH CATEGORY UPDATES:
+  self:     ACFS itself (git pull) - runs FIRST to ensure latest update logic
+            If update.sh changes, automatically re-executes with new version
+            Tarball/non-git installs skip this unless --bootstrap-self-update is used
+  apt:      System packages via apt update && apt upgrade && apt autoremove
+  shell:    Oh-My-Zsh, Powerlevel10k, zsh plugins (git pull)
+            Atuin, Zoxide (reinstall from upstream)
+  agents:   Claude Code (verified installer: curl claude.ai/install.sh | bash -- latest)
+            Codex CLI (bun install -g --trust @openai/codex@latest)
+            Gemini CLI (bun install -g --trust @google/gemini-cli@latest)
+  cloud:    Wrangler, Vercel (bun install -g --trust <pkg>@latest)
+            Supabase CLI (verified GitHub release tarball + sha256 checksums)
+            GitHub CLI (gh extension upgrade --all)
+            Google Cloud SDK (gcloud components update)
+  runtime:  Bun (bun upgrade), Rust (rustup update), uv (uv self update), Go (apt-managed)
+  stack:    Dicklesworthstone stack tools (verified upstream installers)
+            Installs missing tools and updates existing ones automatically:
+            NTM, Agent Mail, Meta Skill, APR, pt, xf, UBS, BV, BR, CASS, CM,
+            CAAM, SLB, RU, DCG, RCH, GIIL, CSCTF, SRPS, TRU, RANO, MDWB, S2P, Brenner Bot
+            Exception: JFP requires subscription, only updated if already installed
+
+LOGS:
+  Update logs are saved to: ~/.acfs/logs/updates/
+  Log files are timestamped: YYYY-MM-DD-HHMMSS.log
+
+  Example: tail -f ~/.acfs/logs/updates/$(ls -1t ~/.acfs/logs/updates | head -1)
+
+ENVIRONMENT VARIABLES:
+  ACFS_HOME          Base directory for ACFS (default: ~/.acfs)
+  ACFS_VERSION       Override version string in logs
+
+TROUBLESHOOTING:
+  - If apt is locked: wait for other package operations to finish.
+    To see who holds the lock:
+      sudo fuser -v /var/lib/dpkg/lock-frontend || true
+      sudo systemctl status unattended-upgrades --no-pager || true
+    If unattended-upgrades is running, wait for it to complete (recommended),
+    or temporarily stop it:
+      sudo systemctl stop unattended-upgrades
+    (After the update finishes, re-enable it:)
+      sudo systemctl start unattended-upgrades
+
+  - If an agent update fails: try running the update command directly:
+    curl -fsSL https://claude.ai/install.sh | bash -s -- latest
+    bun install -g --trust @openai/codex@latest
+    bun install -g --trust @google/gemini-cli@latest
+
+  - If shell tools fail to update: check git remote access:
+    git -C ~/.oh-my-zsh remote -v
+
+  - View recent logs:
+    ls -lt ~/.acfs/logs/updates/ | head -5
+    cat ~/.acfs/logs/updates/LATEST_LOG_FILE
+
+  - Force reinstall a specific tool:
+    acfs-update --force --agents-only
+EOF
+}
+
+main() {
+    # Ensure PATH includes user tool directories
+    ensure_path
+
+    # Save original arguments before parsing (for re-exec after self-update)
+    local -a ACFS_UPDATE_ARGS=("$@")
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --apt-only)
+                UPDATE_APT=true
+                UPDATE_AGENTS=false
+                UPDATE_CLOUD=false
+                UPDATE_RUNTIME=false
+                UPDATE_STACK=false
+                UPDATE_SHELL=false
+                shift
+                ;;
+            --agents-only)
+                UPDATE_APT=false
+                UPDATE_AGENTS=true
+                UPDATE_CLOUD=false
+                UPDATE_RUNTIME=false
+                UPDATE_STACK=false
+                UPDATE_SHELL=false
+                shift
+                ;;
+            --cloud-only)
+                UPDATE_APT=false
+                UPDATE_AGENTS=false
+                UPDATE_CLOUD=true
+                UPDATE_RUNTIME=false
+                UPDATE_STACK=false
+                UPDATE_SHELL=false
+                shift
+                ;;
+            --shell-only)
+                UPDATE_APT=false
+                UPDATE_AGENTS=false
+                UPDATE_CLOUD=false
+                UPDATE_RUNTIME=false
+                UPDATE_STACK=false
+                UPDATE_SHELL=true
+                shift
+                ;;
+            --runtime-only)
+                UPDATE_APT=false
+                UPDATE_AGENTS=false
+                UPDATE_CLOUD=false
+                UPDATE_RUNTIME=true
+                UPDATE_STACK=false
+                UPDATE_SHELL=false
+                shift
+                ;;
+            --stack-only)
+                UPDATE_APT=false
+                UPDATE_AGENTS=false
+                UPDATE_CLOUD=false
+                UPDATE_RUNTIME=false
+                UPDATE_STACK=true
+                UPDATE_SHELL=false
+                shift
+                ;;
+            --stack)
+                UPDATE_STACK=true
+                shift
+                ;;
+            --no-apt)
+                UPDATE_APT=false
+                shift
+                ;;
+            --no-agents)
+                UPDATE_AGENTS=false
+                shift
+                ;;
+            --no-cloud)
+                UPDATE_CLOUD=false
+                shift
+                ;;
+            --no-shell)
+                UPDATE_SHELL=false
+                shift
+                ;;
+            --no-runtime)
+                UPDATE_RUNTIME=false
+                shift
+                ;;
+            --no-stack)
+                UPDATE_STACK=false
+                shift
+                ;;
+            --no-self-update)
+                UPDATE_SELF=false
+                shift
+                ;;
+            --bootstrap-self-update)
+                BOOTSTRAP_SELF_UPDATE=true
+                shift
+                ;;
+            --force)
+                FORCE_MODE=true
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --verbose|-v)
+                VERBOSE=true
+                shift
+                ;;
+            --quiet|-q)
+                QUIET=true
+                shift
+                ;;
+            --yes|-y)
+                YES_MODE=true
+                shift
+                ;;
+            --abort-on-failure)
+                ABORT_ON_FAILURE=true
+                shift
+                ;;
+            --continue)
+                ABORT_ON_FAILURE=false
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                echo "Try: acfs update --help" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    # Guard against running as root (unless ACFS is actually installed in /root)
+    # This check is placed after argument parsing so --yes works correctly
+    if [[ $EUID -eq 0 ]] && [[ "${HOME}" != "/root" ]]; then
+        echo -e "${YELLOW}Warning: Running as root but HOME is $HOME.${NC}"
+        echo "ACFS update should typically be run as the target user (e.g. ubuntu)."
+        if [[ "$YES_MODE" != "true" ]]; then
+            echo -n "Continue anyway? [y/N] "
+            read -r response < /dev/tty || true
+            if [[ ! "$response" =~ ^[Yy] ]]; then
+                exit 1
+            fi
+        fi
+    fi
+
+    # Self-update ACFS before touching any other components.
+    # This runs BEFORE init_logging so we get the latest update logic ASAP.
+    # Pass original args so re-exec (if update.sh changed) uses the same arguments.
+    update_acfs_self "${ACFS_UPDATE_ARGS[@]}"
+
+    # Initialize logging
+    init_logging
+
+    # Header
+    if [[ "$QUIET" != "true" ]]; then
+        echo ""
+        echo -e "${BOLD}ACFS Update $ACFS_VERSION_DISPLAY${NC}"
+        echo -e "User: $(whoami)"
+        echo -e "Date: $(date '+%Y-%m-%d %H:%M')"
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo -e "${YELLOW}Mode: dry-run${NC}"
+        fi
+    fi
+
+    # Set non-interactive mode if --yes was passed
+    if [[ "$YES_MODE" == "true" ]]; then
+        export ACFS_INTERACTIVE=false
+    fi
+
+    # Ensure jq is available (issue #180): on minimal Ubuntu installs jq may
+    # not be present, but later update steps (DCG cleanup, state management)
+    # depend on it. Keep dry-run truly read-only by skipping the install there.
+    update_ensure_jq_available
+
+    # Clean up legacy artifacts from previous versions
+    cleanup_legacy_git_safety_guard
+    cleanup_legacy_br_alias
+    cleanup_legacy_bv_alias
+
+    # Run updates
+    update_apt
+    update_bun
+    update_agents
+    update_cloud
+    update_rust
+    update_cargo_tools
+    update_uv
+    update_go
+    update_shell
+    update_stack
+    update_root_agents_md
+
+    # Summary
+    print_summary
+
+    # Exit code
+    if [[ $FAIL_COUNT -gt 0 ]]; then
+        exit 1
+    fi
+    exit 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

@@ -1,0 +1,1563 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1091
+# ============================================================
+# ACFS Installer - Security Verification Library
+# Provides checksum verification and HTTPS enforcement
+#
+# NOTE: This file is intended to be *sourced* by other scripts. Do not enable
+# global strict mode here, since it would leak `set -euo pipefail` into callers.
+# When executed directly, strict mode is enabled in the entrypoint below.
+# ============================================================
+
+SECURITY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Ensure we have logging functions available
+if [[ -z "${ACFS_BLUE:-}" ]]; then
+    # shellcheck source=logging.sh
+    source "$SECURITY_SCRIPT_DIR/logging.sh" 2>/dev/null || true
+fi
+
+# Fallback logging if logging.sh was not sourced or failed to load
+if ! declare -f log_success &>/dev/null; then
+    log_success() { printf "OK: %s\n" "$1" >&2; }
+    log_error()   { printf "ERROR: %s\n" "$1" >&2; }
+    log_info()    { printf "INFO: %s\n" "$1" >&2; }
+    log_warn()    { printf "WARN: %s\n" "$1" >&2; }
+    log_step()    { printf "[%s] %s\n" "$1" "$2" >&2; }
+    log_detail()  { printf "  %s\n" "$1" >&2; }
+    log_fatal()   { printf "FATAL: %s\n" "$1" >&2; exit 1; }
+fi
+
+# Color aliases for backward compatibility (used by display functions below)
+# Respects NO_COLOR standard via logging.sh's ACFS_* variables.
+# Use ${var-default} (not ${var:-default}) to preserve empty strings.
+# Related: bd-39ye
+CYAN="${ACFS_BLUE-\033[0;36m}"
+DIM="${ACFS_GRAY-\033[0;90m}"
+NC="${ACFS_NC-\033[0m}"
+RED="${ACFS_RED-\033[0;31m}"
+GREEN="${ACFS_GREEN-\033[0;32m}"
+YELLOW="${ACFS_YELLOW-\033[0;33m}"
+
+# ============================================================
+# Configuration
+# ============================================================
+
+ACFS_REPO_OWNER="${ACFS_REPO_OWNER:-Dicklesworthstone}"
+ACFS_REPO_NAME="${ACFS_REPO_NAME:-agentic_coding_flywheel_setup}"
+ACFS_CHECKSUMS_REF="${ACFS_CHECKSUMS_REF:-main}"
+
+# Check if running in interactive mode
+# Returns 0 if interactive, 1 if non-interactive
+_acfs_is_interactive() {
+    [[ "${ACFS_INTERACTIVE:-true}" == "true" ]] || return 1
+
+    # Prefer /dev/tty so curl|bash (stdin is a pipe) can still prompt safely.
+    if [[ -e /dev/tty ]] && (exec 3<>/dev/tty) 2>/dev/null; then
+        return 0
+    fi
+
+    [[ -t 0 ]]
+}
+
+# curl defaults: enforce HTTPS (including redirects) when supported
+ACFS_CURL_BASE_ARGS=(--connect-timeout 30 --max-time 300 -fsSL)
+if command -v curl &>/dev/null && curl --help all 2>/dev/null | grep -q -- '--proto'; then
+    ACFS_CURL_BASE_ARGS=(--proto '=https' --proto-redir '=https' --connect-timeout 30 --max-time 300 -fsSL)
+fi
+
+acfs_curl() {
+    curl "${ACFS_CURL_BASE_ARGS[@]}" "$@"
+}
+
+# Automatic retries for transient network errors (fast total budget).
+ACFS_CURL_RETRY_DELAYS=(0 5 15)
+
+acfs_is_retryable_curl_exit_code() {
+    local exit_code="${1:-0}"
+    case "$exit_code" in
+        6|7|28|35|52|56) return 0 ;; # DNS/connect/timeout/SSL/empty reply/recv error
+        *) return 1 ;;
+    esac
+}
+
+# Download URL to a file with retries.
+# Arguments:
+#   $1 - URL
+#   $2 - Output path
+#   $3 - Name (for logging)
+# Returns: 0 on success, curl exit code on failure
+#
+# For GitHub URLs, uses github_fetch_with_backoff for rate limit handling.
+# Related: bd-1lug
+acfs_download_to_file() {
+    local url="$1"
+    local output_path="$2"
+    local name="${3:-$url}"
+
+    # Ensure parent dir exists
+    mkdir -p "$(dirname "$output_path")"
+
+    # Use GitHub-specific backoff for GitHub URLs (rate limit handling)
+    if [[ "$url" == *"github.com"* || "$url" == *"githubusercontent.com"* ]]; then
+        # Load github_api.sh if not already loaded
+        if ! declare -f github_fetch_with_backoff &>/dev/null; then
+            local github_lib="$SECURITY_SCRIPT_DIR/github_api.sh"
+            if [[ -r "$github_lib" ]]; then
+                # shellcheck source=github_api.sh
+                source "$github_lib"
+            fi
+        fi
+
+        # Use backoff if available, fallback to standard fetch
+        if declare -f github_fetch_with_backoff &>/dev/null; then
+            github_fetch_with_backoff "$url" "$output_path" "$name"
+            return $?
+        fi
+    fi
+
+    # Standard retry logic for non-GitHub URLs
+    local max_attempts="${#ACFS_CURL_RETRY_DELAYS[@]}"
+    if (( max_attempts == 0 )); then
+        ACFS_CURL_RETRY_DELAYS=(0 5 15)
+        max_attempts="${#ACFS_CURL_RETRY_DELAYS[@]}"
+    fi
+
+    local retries=$((max_attempts - 1))
+    local attempt delay status=0
+
+    for ((attempt=0; attempt<max_attempts; attempt++)); do
+        delay="${ACFS_CURL_RETRY_DELAYS[$attempt]}"
+
+        if (( attempt > 0 )); then
+            log_info "Retry ${attempt}/${retries} for fetching ${name} (waiting ${delay}s)..."
+            sleep "$delay"
+        fi
+
+        # Use -o to save to file directly
+        if acfs_curl "$url" -o "$output_path"; then
+            (( attempt > 0 )) && log_info "Succeeded on retry ${attempt} for fetching ${name}"
+            return 0
+        else
+            status=$?
+        fi
+
+        if ! acfs_is_retryable_curl_exit_code "$status"; then
+            return "$status"
+        fi
+    done
+
+    log_error "Failed to download $name after $max_attempts attempts (exit code $status)"
+    return 1
+}
+
+# Checksums file location.
+# Prefer the repo-root checksums.yaml based on this script's location.
+# Security: Always use absolute paths to prevent path traversal attacks.
+DEFAULT_CHECKSUMS_FILE="$SECURITY_SCRIPT_DIR/../../checksums.yaml"
+
+# Resolve to absolute path to prevent working directory manipulation
+if [[ -r "$DEFAULT_CHECKSUMS_FILE" ]]; then
+    # Use realpath if available, otherwise use cd/pwd to get absolute path
+    if command -v realpath &>/dev/null; then
+        DEFAULT_CHECKSUMS_FILE="$(realpath "$DEFAULT_CHECKSUMS_FILE")"
+    else
+        DEFAULT_CHECKSUMS_FILE="$(cd "$(dirname "$DEFAULT_CHECKSUMS_FILE")" && pwd)/$(basename "$DEFAULT_CHECKSUMS_FILE")"
+    fi
+    CHECKSUMS_FILE="${CHECKSUMS_FILE:-$DEFAULT_CHECKSUMS_FILE}"
+else
+    # If default not found and CHECKSUMS_FILE not set, use absolute path to repo root
+    # Never fall back to relative path as it could be manipulated
+    if [[ -z "${CHECKSUMS_FILE:-}" ]]; then
+        # Try to find checksums.yaml relative to ACFS_REPO_ROOT if available
+        if [[ -n "${ACFS_REPO_ROOT:-}" && -r "${ACFS_REPO_ROOT}/checksums.yaml" ]]; then
+            CHECKSUMS_FILE="${ACFS_REPO_ROOT}/checksums.yaml"
+        else
+            # No checksums file found - will be handled at verification time
+            CHECKSUMS_FILE=""
+        fi
+    fi
+fi
+
+# Known installer URLs and their expected checksums
+# Format: URL|SHA256 (computed from the install script content)
+# These are reference checksums - actual scripts may change
+declare -gA KNOWN_INSTALLERS=(
+    [bun]="https://bun.sh/install"
+    [claude]="https://claude.ai/install.sh"
+    [uv]="https://astral.sh/uv/install.sh"
+    [rust]="https://sh.rustup.rs"
+    [nvm]="https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh"
+    [ohmyzsh]="https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh"
+    [opencode]="https://opencode.ai/install"
+    [zoxide]="https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh"
+    [atuin]="https://setup.atuin.sh"
+    [ntm]="https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh"
+    [mcp_agent_mail]="https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh"
+    [ubs]="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/install.sh"
+    [bv]="https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/main/install.sh"
+    [cass]="https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh"
+    [cm]="https://raw.githubusercontent.com/Dicklesworthstone/cass_memory_system/main/install.sh"
+    [caam]="https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_account_manager/main/install.sh"
+    [slb]="https://raw.githubusercontent.com/Dicklesworthstone/simultaneous_launch_button/main/scripts/install.sh"
+    [dcg]="https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh"
+    [ru]="https://raw.githubusercontent.com/Dicklesworthstone/repo_updater/main/install.sh"
+    [apr]="https://raw.githubusercontent.com/Dicklesworthstone/automated_plan_reviser_pro/main/install.sh"
+    [ms]="https://raw.githubusercontent.com/Dicklesworthstone/meta_skill/main/scripts/install.sh"
+    [pt]="https://raw.githubusercontent.com/Dicklesworthstone/process_triage/main/install.sh"
+    [srps]="https://raw.githubusercontent.com/Dicklesworthstone/system_resource_protection_script/main/install.sh"
+    [xf]="https://raw.githubusercontent.com/Dicklesworthstone/xf/main/install.sh"
+    [giil]="https://raw.githubusercontent.com/Dicklesworthstone/giil/main/install.sh"
+    [csctf]="https://raw.githubusercontent.com/Dicklesworthstone/chat_shared_conversation_to_file/main/install.sh"
+    [jfp]="https://jeffreysprompts.com/install-cli.sh"
+    [br]="https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh"
+    [brenner_bot]="https://raw.githubusercontent.com/Dicklesworthstone/brenner_bot/main/install.sh"
+    [rch]="https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh"
+    [tru]="https://raw.githubusercontent.com/Dicklesworthstone/toon_rust/main/install.sh"
+    [rano]="https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install.sh"
+    [mdwb]="https://raw.githubusercontent.com/Dicklesworthstone/markdown_web_browser/main/install.sh"
+    [s2p]="https://raw.githubusercontent.com/Dicklesworthstone/source_to_prompt_tui/main/install.sh"
+    [gemini_patch]="https://raw.githubusercontent.com/Dicklesworthstone/misc_coding_agent_tips_and_scripts/main/fix-gemini-cli-ebadf-crash.sh"
+    [fsfs]="https://raw.githubusercontent.com/Dicklesworthstone/frankensearch/main/install.sh"
+    [sbh]="https://raw.githubusercontent.com/Dicklesworthstone/storage_ballast_helper/main/scripts/install.sh"
+    [casr]="https://raw.githubusercontent.com/Dicklesworthstone/cross_agent_session_resumer/main/install.sh"
+    [dsr]="https://raw.githubusercontent.com/Dicklesworthstone/doodlestein_self_releaser/main/install.sh"
+    [asb]="https://raw.githubusercontent.com/Dicklesworthstone/agent_settings_backup_script/main/install.sh"
+    [pcr]="https://raw.githubusercontent.com/Dicklesworthstone/post_compact_reminder/main/install-post-compact-reminder.sh"
+)
+
+# ============================================================
+# Checksum Verification Policy
+# ============================================================
+#
+# ACFS fails closed on checksum mismatch: scripts are NOT executed unless the
+# downloaded bytes match checksums.yaml exactly.
+
+# ============================================================
+# HTTPS Enforcement
+# ============================================================
+
+# Check if a URL is HTTPS
+is_https() {
+    local url="$1"
+    [[ "$url" =~ ^https:// ]]
+}
+
+# Enforce HTTPS - fail if URL is not HTTPS
+enforce_https() {
+    local url="$1"
+    local name="${2:-unknown}"
+
+    if ! is_https "$url"; then
+        log_error "Security Error: URL for '$name' is not HTTPS"
+        printf "  URL: %s\n" "$url" >&2
+        printf "  All installer URLs must use HTTPS.\n" >&2
+        return 1
+    fi
+    return 0
+}
+
+# ============================================================
+# Checksum Verification
+# ============================================================
+
+# Calculate SHA256 of a file
+# Arguments:
+#   $1 - File path
+calculate_file_sha256() {
+    local filepath="$1"
+    if [[ ! -r "$filepath" ]]; then
+        log_error "Cannot read file for checksum: $filepath"
+        return 1
+    fi
+
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$filepath" | cut -d' ' -f1
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$filepath" | cut -d' ' -f1
+    else
+        log_error "No SHA256 tool available"
+        return 1
+    fi
+}
+
+# Calculate SHA256 from stdin
+# Usage: printf 'content' | calculate_sha256
+calculate_sha256() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum | cut -d' ' -f1
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 | cut -d' ' -f1
+    else
+        log_error "No SHA256 tool available"
+        return 1
+    fi
+}
+
+# Fetch content and calculate checksum (using temp file)
+fetch_checksum() {
+    local url="$1"
+
+    if ! enforce_https "$url"; then
+        return 1
+    fi
+
+    # Create safe temp file
+    local tmp_file
+    tmp_file="$(mktemp "${TMPDIR:-/tmp}/acfs-fetch.XXXXXX")" || {
+        log_error "Failed to create temp file"
+        return 1
+    }
+    # Ensure cleanup on return
+    trap 'rm -f "${tmp_file:-}" 2>/dev/null' RETURN
+
+    if ! acfs_download_to_file "$url" "$tmp_file" "$url"; then
+        log_error "Failed to fetch $url"
+        return 1
+    fi
+
+    local file_sha256
+    if ! file_sha256=$(calculate_file_sha256 "$tmp_file"); then
+        log_error "Failed to checksum $url"
+        return 1
+    fi
+
+    printf '%s\n' "$file_sha256"
+}
+
+# Verify URL content against expected checksum
+#
+# Downloads to a temporary file, verifies the checksum, and if valid,
+# prints the content to stdout. This ensures binary safety (no null byte stripping)
+# and verification before execution.
+#
+# Arguments:
+#   $1 - URL
+#   $2 - Expected SHA256
+#   $3 - Name (for logging)
+verify_checksum() {
+    local url="$1"
+    local expected_sha256="$2"
+    local name="${3:-installer}"
+    local fresh_tmp_file=""
+    local verify_tmp=""
+
+    if ! enforce_https "$url"; then
+        return 1
+    fi
+
+    # Create safe temp file
+    local tmp_file
+    tmp_file="$(mktemp "${TMPDIR:-/tmp}/acfs-verify.XXXXXX")" || {
+        log_error "Failed to create temp file for $name"
+        return 1
+    }
+    # Ensure cleanup on return (covers all temp files this function creates)
+    trap 'rm -f "${tmp_file:-}" "${fresh_tmp_file:-}" "${verify_tmp:-}" 2>/dev/null' RETURN
+
+    if ! acfs_download_to_file "$url" "$tmp_file" "$name"; then
+        log_error "Security Error: Failed to fetch $name"
+        return 1
+    fi
+
+    local actual_sha256
+    actual_sha256=$(calculate_file_sha256 "$tmp_file") || {
+        log_error "Security Error: Failed to checksum $name"
+        return 1
+    }
+
+    if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+        local refreshed_expected_sha256=""
+        local refreshed_url="$url"
+        local refreshed_actual_sha256=""
+
+        if acfs_refresh_loaded_checksums_from_remote; then
+            refreshed_expected_sha256="$(get_checksum "$name")"
+            refreshed_url="${KNOWN_INSTALLERS[$name]:-$url}"
+
+            if [[ -n "$refreshed_expected_sha256" ]]; then
+                if [[ "$refreshed_url" == "$url" && "$actual_sha256" == "$refreshed_expected_sha256" ]]; then
+                    log_success "Verified with refreshed checksums: $name"
+                    cat "$tmp_file"
+                    return $?
+                fi
+
+                fresh_tmp_file="$(mktemp "${TMPDIR:-/tmp}/acfs-verify.XXXXXX" 2>/dev/null)" || fresh_tmp_file=""
+                if [[ -n "$fresh_tmp_file" ]] && acfs_download_to_file "$refreshed_url" "$fresh_tmp_file" "$name"; then
+                    refreshed_actual_sha256="$(calculate_file_sha256 "$fresh_tmp_file")" || refreshed_actual_sha256=""
+                    if [[ -n "$refreshed_actual_sha256" && "$refreshed_actual_sha256" == "$refreshed_expected_sha256" ]]; then
+                        log_success "Verified with refreshed checksums: $name"
+                        cat "$fresh_tmp_file"
+                        return $?
+                    fi
+                fi
+
+                expected_sha256="$refreshed_expected_sha256"
+                url="$refreshed_url"
+                [[ -n "$refreshed_actual_sha256" ]] && actual_sha256="$refreshed_actual_sha256"
+            fi
+        fi
+
+        # Trusted-tool auto-accept: for tools hosted under the same GitHub
+        # owner as ACFS itself (Dicklesworthstone), the checksum mismatch is
+        # almost certainly a stale checksums.yaml rather than a supply-chain
+        # attack (the same owner controls both ACFS and the tool repo).
+        #
+        # To proceed safely we:
+        #   1. Verify the URL belongs to the trusted owner
+        #   2. Re-download the installer to confirm consistency (guards
+        #      against transient corruption or MITM)
+        #   3. Accept the installer with a prominent warning
+        #
+        # External tools (ohmyzsh, rustup, bun, etc.) always hard-fail.
+        local trusted_owner="${ACFS_REPO_OWNER:-Dicklesworthstone}"
+        local effective_url="$url"
+        local effective_file="$tmp_file"
+        local effective_sha="$actual_sha256"
+        # Use the refreshed download if available and non-empty
+        if [[ -n "${fresh_tmp_file:-}" && -s "${fresh_tmp_file:-}" ]]; then
+            effective_file="$fresh_tmp_file"
+            effective_sha="${refreshed_actual_sha256:-$actual_sha256}"
+            effective_url="${refreshed_url:-$url}"
+        fi
+
+        if [[ "$effective_url" == *"githubusercontent.com/${trusted_owner}/"* ]] || \
+           [[ "$effective_url" == *"github.com/${trusted_owner}/"* ]]; then
+            # Consistency check: re-download and compare hash to rule out
+            # transient corruption or CDN split-brain.
+            verify_tmp="$(mktemp "${TMPDIR:-/tmp}/acfs-trust-verify.XXXXXX" 2>/dev/null)" || verify_tmp=""
+            if [[ -n "$verify_tmp" ]]; then
+                local verify_sha=""
+                if acfs_download_to_file "$effective_url" "$verify_tmp" "${name}-verify" 2>/dev/null; then
+                    verify_sha="$(calculate_file_sha256 "$verify_tmp" 2>/dev/null)" || verify_sha=""
+                fi
+
+                if [[ -n "$verify_sha" && "$verify_sha" == "$effective_sha" ]]; then
+                    # Content is consistent across two downloads — accept it
+                    printf "${YELLOW}Warning: Trusted-tool auto-accept for %s${NC}\n" "$name" >&2
+                    printf "  Stale checksum: %s\n" "$expected_sha256" >&2
+                    printf "  Upstream hash:  %s\n" "$effective_sha" >&2
+                    printf "  URL: %s\n" "$effective_url" >&2
+                    printf "  The ACFS checksums.yaml is stale; accepting because %s owns both ACFS and this tool.\n" "$trusted_owner" >&2
+                    printf "  Checksums will be refreshed by the next checksum-monitor run.\n" >&2
+                    rm -f "$verify_tmp" 2>/dev/null
+                    cat "$effective_file"
+                    return $?
+                fi
+                rm -f "$verify_tmp" 2>/dev/null
+            fi
+        fi
+
+        log_error "Security Error: Checksum mismatch for $name"
+        printf "  Expected: %s\n" "$expected_sha256" >&2
+        printf "  Actual:   %s\n" "$actual_sha256" >&2
+        printf "  URL: %s\n" "$url" >&2
+        printf "  Refusing to execute unverified installer script.\n" >&2
+        printf "  Fix:\n" >&2
+        printf "    - End users: update ACFS to refresh checksums.yaml (re-run install.sh / update scripts)\n" >&2
+        printf "    - Maintainers: regenerate checksums.yaml with:\n" >&2
+        printf "        ./scripts/lib/security.sh --update-checksums > checksums.yaml\n" >&2
+        return 1
+    fi
+
+    log_success "Verified: $name"
+    # Return the verified content (verbatim bytes) on stdout.
+    cat "$tmp_file"
+    return $?
+}
+
+# Fetch and run with optional verification
+fetch_and_run() {
+    local url="$1"
+    local expected_sha256="${2:-}"
+    local name="${3:-installer}"
+    shift 3 || true
+    local args=("$@")
+
+    if ! enforce_https "$url"; then
+        return 1
+    fi
+
+    if [[ -z "$expected_sha256" ]]; then
+        log_error "Security Error: Missing checksum for $name"
+        printf "  URL: %s\n" "$url" >&2
+        printf "  Refusing to execute unverified installer script.\n" >&2
+        printf "  Fix:\n" >&2
+        printf "    - End users: update ACFS to refresh checksums.yaml (re-run install.sh / update scripts)\n" >&2
+        printf "    - Maintainers: regenerate checksums.yaml with:\n" >&2
+        printf "        ./scripts/lib/security.sh --update-checksums > checksums.yaml\n" >&2
+        return 1
+    fi
+
+    (
+        set -o pipefail
+        verify_checksum "$url" "$expected_sha256" "$name" | bash -s -- "${args[@]}"
+    )
+}
+
+# ============================================================
+# Fetch and Run with Recovery (bead anq)
+# ============================================================
+
+# Fetch and run installer with checksum mismatch recovery
+#
+# Unlike fetch_and_run(), this function handles checksum mismatches
+# gracefully by calling handle_checksum_mismatch() which can:
+#   - Skip the tool (return 0)
+#   - Abort installation (return 1)
+#
+# NOTE: Mismatched scripts are not executed. To install updated scripts, regenerate checksums.yaml.
+#
+# Arguments:
+#   $1 - URL to fetch
+#   $2 - Expected SHA256 checksum
+#   $3 - Tool name (for display and classification)
+#   $@ - Additional args to pass to the installer
+#
+# Environment:
+#   ACFS_INTERACTIVE - "true" for prompts, "false" for auto-handling
+#   ACFS_BATCH_CHECKSUMS - "true" to defer to batch handler
+#
+# Returns:
+#   0 - Success (installed or skipped)
+#   1 - Failure (abort or error)
+#
+fetch_and_run_with_recovery() {
+    local url="$1"
+    local expected_sha256="${2:-}"
+    local name="${3:-installer}"
+    shift 3 || true
+    local args=("$@")
+
+    if ! enforce_https "$url"; then
+        return 1
+    fi
+
+    if [[ -z "$expected_sha256" ]]; then
+        log_error "Security Error: Missing checksum for $name"
+        printf "  URL: %s\n" "$url" >&2
+        printf "  Refusing to execute unverified installer script.\n" >&2
+        printf "  Fix:\n" >&2
+        printf "    - End users: update ACFS to refresh checksums.yaml (re-run install.sh / update scripts)\n" >&2
+        printf "    - Maintainers: regenerate checksums.yaml with:\n" >&2
+        printf "        ./scripts/lib/security.sh --update-checksums > checksums.yaml\n" >&2
+        return 1
+    fi
+
+    # Create safe temp file
+    local tmp_file
+    tmp_file="$(mktemp "${TMPDIR:-/tmp}/acfs-recovery.XXXXXX")" || {
+        log_error "Failed to create temp file for $name"
+        return 1
+    }
+    # Ensure cleanup on return
+    trap 'rm -f "${tmp_file:-}" 2>/dev/null' RETURN
+
+    # Fetch content to file with retries
+    if ! acfs_download_to_file "$url" "$tmp_file" "$name"; then
+        log_error "Error: Failed to fetch $name"
+        return 1
+    fi
+
+    # Calculate actual checksum
+    local actual_sha256
+    actual_sha256=$(calculate_file_sha256 "$tmp_file") || {
+        log_error "Error: Failed to calculate checksum for $name"
+        return 1
+    }
+
+    # Check for mismatch
+    if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+        # Call mismatch handler
+        handle_checksum_mismatch "$name" "$expected_sha256" "$actual_sha256" "$url"
+        local mismatch_result=$?
+
+        case $mismatch_result in
+            0)
+                # Skip - tool was skipped, continue installation
+                log_info "Skipped: $name (checksum mismatch)"
+                return 0
+                ;;
+            1)
+                # Abort - user or policy chose to abort
+                return 1
+                ;;
+        esac
+    fi
+
+    log_success "Verified: $name"
+    
+    # Run the installer
+    bash "$tmp_file" "${args[@]}"
+}
+
+# ============================================================
+# Print Mode Support
+# ============================================================
+
+# Print all upstream URLs that will be fetched
+print_upstream_urls() {
+    echo ""
+    printf "${CYAN}Upstream Installers${NC}\n"
+    echo "============================================================"
+    echo ""
+    echo "The following scripts will be downloaded and executed:"
+    echo ""
+
+    for name in "${!KNOWN_INSTALLERS[@]}"; do
+        local url="${KNOWN_INSTALLERS[$name]}"
+        printf "  %-20s %s\n" "$name:" "$url"
+    done | sort
+
+    echo ""
+    printf "${DIM}All URLs use HTTPS for secure transport.${NC}\n"
+    echo ""
+}
+
+# Print URLs with current checksums (for updating checksums.yaml)
+print_current_checksums() {
+    local had_failure=false
+    local tmp_output=""
+
+    if command -v mktemp &>/dev/null; then
+        tmp_output=$(mktemp "${TMPDIR:-/tmp}/acfs-checksums-out.XXXXXX" 2>/dev/null) || tmp_output=""
+    fi
+
+    if [[ -z "$tmp_output" ]]; then
+        echo "ERROR: unable to create temp file for checksums output" >&2
+        return 1
+    fi
+
+    # Progress info to stderr (not part of YAML output)
+    echo "" >&2
+    printf "${CYAN}Generating checksums.yaml...${NC}\n" >&2
+    echo "" >&2
+
+    {
+        # YAML output to stdout
+        echo "# checksums.yaml - Auto-generated $(date -Iseconds)"
+        echo "# Run: ./scripts/lib/security.sh --update-checksums"
+        echo ""
+        echo "installers:"
+    } >"$tmp_output"
+
+    local -a installer_names=()
+    local name=""
+    for name in "${!KNOWN_INSTALLERS[@]}"; do
+        installer_names+=("$name")
+    done
+    if [[ ${#installer_names[@]} -gt 0 ]]; then
+        mapfile -t installer_names < <(printf '%s\n' "${installer_names[@]}" | sort)
+    fi
+
+    for name in "${installer_names[@]}"; do
+        local url="${KNOWN_INSTALLERS[$name]}"
+        local sha256
+
+        printf "  Fetching %s... " "$name" >&2
+        sha256=$(fetch_checksum "$url" 2>/dev/null) || {
+            echo "FAILED" >&2
+            had_failure=true
+            continue
+        }
+
+        if [[ ! "$sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "FAILED (invalid hash format)" >&2
+            had_failure=true
+            continue
+        fi
+        echo "done" >&2
+
+        {
+            echo "  $name:"
+            echo "    url: \"$url\""
+            echo "    sha256: \"$sha256\""
+            echo ""
+        } >>"$tmp_output"
+    done
+
+    if [[ "$had_failure" == "true" ]]; then
+        rm -f "$tmp_output" 2>/dev/null || true
+        echo "ERROR: one or more installer checksums failed to fetch; refusing to emit incomplete checksums.yaml" >&2
+        return 1
+    fi
+
+    cat "$tmp_output"
+    rm -f "$tmp_output" 2>/dev/null || true
+}
+
+# ============================================================
+# Checksums File Management
+# ============================================================
+
+# Load checksums from YAML file (simple parser)
+# shellcheck disable=SC2120  # $1 is optional with default
+load_checksums() {
+    local file="${1:-$CHECKSUMS_FILE}"
+    local current_tool=""
+    local in_installers=false
+    local installers_indent=0
+    local tool_indent=""
+    # Use ACFS colors if available, preserving empty-string NO_COLOR behavior.
+    local warn_color="${ACFS_YELLOW-\033[0;33m}"
+    local nc_color="${ACFS_NC-\033[0m}"
+
+    if [[ ! -r "$file" ]]; then
+        printf "${warn_color}Warning:${nc_color} Checksums file not found: %s\n" "$file" >&2
+        return 1
+    fi
+
+    # Clear any previously loaded checksums (avoid stale entries if reloaded).
+    LOADED_CHECKSUMS=()
+
+    # Lightweight YAML parsing for our specific format:
+    #
+    # installers:
+    #   tool_name:
+    #     url: "https://..."
+    #     sha256: "0123...abcd"
+    #
+    # Rules:
+    # - Only read entries under the top-level "installers:" mapping.
+    # - Tool keys are detected as a mapping key with an empty value (e.g. "  bun:").
+    # - Accept SHA256 values with or without quotes, and allow uppercase hex.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+
+        local indent="${line%%[^ ]*}"
+        local indent_len="${#indent}"
+
+        if [[ "$in_installers" == "false" ]]; then
+            if [[ "$line" =~ ^[[:space:]]*installers:[[:space:]]*$ ]]; then
+                in_installers=true
+                installers_indent="$indent_len"
+                tool_indent=""
+                current_tool=""
+            fi
+            continue
+        fi
+
+        # Stop parsing when leaving the installers section.
+        if (( indent_len <= installers_indent )); then
+            in_installers=false
+            tool_indent=""
+            current_tool=""
+            continue
+        fi
+
+        # Match tool name (a mapping key line like "  bun:")
+        if [[ "$line" =~ ^[[:space:]]*([[:alnum:]_-]+):[[:space:]]*$ ]]; then
+            if [[ -z "$tool_indent" ]]; then
+                tool_indent="$indent_len"
+            fi
+
+            if (( indent_len == tool_indent )); then
+                current_tool="${BASH_REMATCH[1]}"
+                continue
+            fi
+        fi
+
+        # Match url value for the current tool — override KNOWN_INSTALLERS so
+        # stale URLs baked into an older security.sh are corrected when
+        # checksums.yaml is refreshed from GitHub.
+        if [[ -n "$current_tool" ]] && [[ "$line" =~ url:[[:space:]]*\"(https://[^\"]+)\" ]]; then
+            KNOWN_INSTALLERS["$current_tool"]="${BASH_REMATCH[1]}"
+        fi
+
+        # Match sha256 value for the current tool.
+        if [[ -n "$current_tool" ]] && [[ "$line" =~ sha256:[[:space:]]*['\"]?([0-9A-Fa-f]{64})['\"]? ]]; then
+            LOADED_CHECKSUMS["$current_tool"]="${BASH_REMATCH[1],,}"
+        fi
+    done < "$file"
+
+    if [[ ${#LOADED_CHECKSUMS[@]} -eq 0 ]]; then
+        printf "${warn_color}Warning:${nc_color} No valid installer checksums found in: %s\n" "$file" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# Get checksum for a tool
+get_checksum() {
+    local tool="$1"
+    echo "${LOADED_CHECKSUMS[$tool]:-}"
+}
+
+# Associative array to store loaded checksums
+declare -gA LOADED_CHECKSUMS=()
+declare -g ACFS_CHECKSUMS_REMOTE_REFRESHED=false
+
+acfs_checksums_file_looks_valid() {
+    local file="$1"
+    [[ -r "$file" ]] || return 1
+    grep -Eq '^[[:space:]]*installers:[[:space:]]*$' "$file"
+}
+
+acfs_fetch_fresh_checksums_to_file() {
+    local dest="$1"
+    local api_url="https://api.github.com/repos/${ACFS_REPO_OWNER}/${ACFS_REPO_NAME}/contents/checksums.yaml?ref=${ACFS_CHECKSUMS_REF}"
+    local raw_url="https://raw.githubusercontent.com/${ACFS_REPO_OWNER}/${ACFS_REPO_NAME}/${ACFS_CHECKSUMS_REF}/checksums.yaml?cb=$(date +%s)"
+
+    : > "$dest" 2>/dev/null || {
+        log_detail "Unable to initialize temporary checksums file: $dest"
+        return 1
+    }
+
+    if acfs_curl \
+        -H "Accept: application/vnd.github.raw" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "$api_url" \
+        -o "$dest" 2>/dev/null; then
+        if acfs_checksums_file_looks_valid "$dest"; then
+            return 0
+        fi
+        log_detail "GitHub API returned unexpected checksums.yaml content"
+    else
+        log_detail "GitHub API fetch for checksums.yaml failed"
+    fi
+
+    if acfs_download_to_file "$raw_url" "$dest" "checksums.yaml"; then
+        if acfs_checksums_file_looks_valid "$dest"; then
+            return 0
+        fi
+        log_detail "Raw checksums.yaml fetch returned unexpected content"
+    else
+        log_detail "Raw checksums.yaml fetch failed"
+    fi
+
+    return 1
+}
+
+acfs_refresh_loaded_checksums_from_remote() {
+    if [[ "$ACFS_CHECKSUMS_REMOTE_REFRESHED" == "true" ]]; then
+        return 0
+    fi
+
+    local refreshed_file=""
+    refreshed_file="$(mktemp "${TMPDIR:-/tmp}/acfs-checksums-refresh.XXXXXX" 2>/dev/null)" || refreshed_file=""
+    if [[ -z "$refreshed_file" ]]; then
+        log_detail "Unable to create temp file for refreshed checksums"
+        return 1
+    fi
+
+    if ! acfs_fetch_fresh_checksums_to_file "$refreshed_file"; then
+        rm -f "$refreshed_file"
+        return 1
+    fi
+
+    if ! load_checksums "$refreshed_file"; then
+        rm -f "$refreshed_file"
+        return 1
+    fi
+
+    ACFS_CHECKSUMS_REMOTE_REFRESHED=true
+    rm -f "$refreshed_file"
+    return 0
+}
+
+# ============================================================
+# Checksum Mismatch Batching
+# Related: agentic_coding_flywheel_setup-4jr
+# ============================================================
+
+# Array to collect checksum mismatches during verification phase
+# Format: "tool|url|expected|actual"
+declare -g -a CHECKSUM_MISMATCHES=()
+
+# Record a checksum mismatch for later batched handling
+#
+# Arguments:
+#   $1 - Tool name
+#   $2 - URL
+#   $3 - Expected checksum
+#   $4 - Actual checksum
+#
+record_checksum_mismatch() {
+    local tool="$1"
+    local url="$2"
+    local expected="$3"
+    local actual="$4"
+
+    CHECKSUM_MISMATCHES+=("$tool|$url|$expected|$actual")
+}
+
+# Clear all recorded mismatches
+clear_checksum_mismatches() {
+    CHECKSUM_MISMATCHES=()
+}
+
+# Get count of recorded mismatches
+count_checksum_mismatches() {
+    echo "${#CHECKSUM_MISMATCHES[@]}"
+}
+
+# Check if any mismatches were recorded
+has_checksum_mismatches() {
+    [[ ${#CHECKSUM_MISMATCHES[@]} -gt 0 ]]
+}
+
+# Handle all checksum mismatches with batched prompts
+#
+# Instead of prompting for each mismatch, this function:
+#   1. Collects all mismatches first (via record_checksum_mismatch)
+#   2. Presents ONE decision prompt with S/A options (fail closed)
+#   3. Handles non-interactive mode based on tool classification
+#
+# Environment:
+#   ACFS_INTERACTIVE - "true" for interactive, "false" for non-interactive
+#   ACFS_STRICT_MODE - "true" treats all mismatches as critical
+#
+# Returns:
+#   0 - User chose to skip mismatched tools (or no mismatches)
+#   1 - User chose to abort (or critical tool mismatch in non-interactive)
+#
+handle_all_checksum_mismatches() {
+    if ! has_checksum_mismatches; then
+        return 0  # No mismatches, all good
+    fi
+
+    local mismatch_count
+    mismatch_count="$(count_checksum_mismatches)"
+
+    if [[ "${ACFS_STRICT_MODE:-false}" == "true" ]]; then
+        echo "" >&2
+        printf "${RED}Security Error:${NC} Checksum mismatches detected (strict mode). Aborting.\n" >&2
+        echo "" >&2
+        for entry in "${CHECKSUM_MISMATCHES[@]}"; do
+            IFS="|" read -r tool url expected actual <<< "$entry"
+            printf "  ${RED}[mismatch]${NC} %s\n" "$tool" >&2
+            printf "      Expected: %.16s...\n" "$expected" >&2
+            printf "      Actual:   %.16s...\n" "$actual" >&2
+            printf "      URL: %s\n" "$url" >&2
+            echo "" >&2
+        done
+        return 1
+    fi
+
+    # Source tools.sh for CRITICAL vs RECOMMENDED classification
+    local tools_lib="${SECURITY_SCRIPT_DIR}/tools.sh"
+    if [[ -r "$tools_lib" ]]; then
+        # shellcheck source=tools.sh
+        source "$tools_lib"
+    fi
+
+    # Non-interactive mode handling
+    if ! _acfs_is_interactive; then
+        _handle_mismatches_noninteractive
+        return $?
+    fi
+
+    # Interactive mode: display mismatches and prompt
+    echo "" >&2
+    printf "${YELLOW}============================================================${NC}\n" >&2
+    printf "${YELLOW}  Checksum Mismatches Detected: %s installer(s)${NC}\n" "$mismatch_count" >&2
+    printf "${YELLOW}============================================================${NC}\n" >&2
+    echo "" >&2
+    echo "The following installers have changed since checksums.yaml was generated:" >&2
+    echo "" >&2
+
+    local has_critical=false
+    local critical_tools=()
+    local recommended_tools=()
+
+    for entry in "${CHECKSUM_MISMATCHES[@]}"; do
+        IFS="|" read -r tool url expected actual <<< "$entry"
+
+        local classification="recommended"
+        if declare -f is_critical_tool &>/dev/null && is_critical_tool "$tool"; then
+            classification="critical"
+            has_critical=true
+            critical_tools+=("$tool")
+        else
+            recommended_tools+=("$tool")
+        fi
+
+        local classification_label
+        if [[ "$classification" == "critical" ]]; then
+            classification_label="${RED}[CRITICAL]${NC}"
+        else
+            classification_label="${YELLOW}[optional]${NC}"
+        fi
+
+        echo -e "  $classification_label $tool:" >&2
+        printf "      Expected: %.16s...\n" "$expected" >&2
+        printf "      Actual:   %.16s...\n" "$actual" >&2
+        printf "      URL: %s\n" "$url" >&2
+        echo "" >&2
+    done
+
+    echo "This usually means upstream scripts were updated (normal)." >&2
+    echo "In rare cases, it could indicate a security issue." >&2
+    echo "" >&2
+
+    if [[ "$has_critical" == "true" ]]; then
+        printf "${RED}ABORTING: %s CRITICAL tool(s) have checksum mismatches.${NC}\n" "${#critical_tools[@]}" >&2
+        printf "ACFS will not run unverified CRITICAL installers.\n" >&2
+        printf "Fix: update ACFS/checksums.yaml (or pin ACFS_REF to a known-good version) and re-run.\n" >&2
+        return 1
+    fi
+
+    echo "Options:" >&2
+    echo "  [S] Skip mismatched tools, install everything else" >&2
+    echo "  [A] Abort installation" >&2
+    echo "" >&2
+
+    local choice
+    if [[ -t 0 ]]; then
+        read -r -p "Choice [s/A]: " choice < /dev/tty
+    elif [[ -r /dev/tty ]]; then
+        read -r -p "Choice [s/A]: " choice < /dev/tty
+    else
+        choice=""
+    fi
+
+    case "${choice,,}" in
+        s|skip)
+            # Add all mismatched tools to SKIPPED_TOOLS
+            for entry in "${CHECKSUM_MISMATCHES[@]}"; do
+                IFS="|" read -r tool url _ _ <<< "$entry"
+                if declare -f record_skipped_tool &>/dev/null; then
+                    record_skipped_tool "$tool" "Checksum mismatch (user chose to skip)" "$url"
+                else
+                    SKIPPED_TOOLS+=("$tool")
+                fi
+            done
+            clear_checksum_mismatches
+            return 0
+            ;;
+        a|abort|"")
+            printf "${RED}Installation aborted by user.${NC}\n" >&2
+            return 1
+            ;;
+        *)
+            printf "Invalid choice. Aborting for safety.\n" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Internal: Handle mismatches in non-interactive mode
+#
+# Rules:
+#   - CRITICAL tool mismatch → abort
+#   - RECOMMENDED tool mismatch → auto-skip with warning
+#
+_handle_mismatches_noninteractive() {
+    local has_critical=false
+    local critical_names=()
+
+    echo "" >&2
+    printf "${YELLOW}Checksum mismatches detected (non-interactive mode):${NC}\n" >&2
+    echo "" >&2
+
+    for entry in "${CHECKSUM_MISMATCHES[@]}"; do
+        IFS="|" read -r tool url expected actual <<< "$entry"
+
+        local is_crit=false
+        if [[ "${ACFS_STRICT_MODE:-false}" == "true" ]]; then
+            is_crit=true
+        elif declare -f is_critical_tool &>/dev/null && is_critical_tool "$tool"; then
+            is_crit=true
+        fi
+
+        if [[ "$is_crit" == "true" ]]; then
+            printf "  ${RED}[CRITICAL]${NC} %s - checksum mismatch\n" "$tool" >&2
+            has_critical=true
+            critical_names+=("$tool")
+        else
+            printf "  ${YELLOW}[skipping]${NC} %s - checksum mismatch\n" "$tool" >&2
+            if declare -f record_skipped_tool &>/dev/null; then
+                record_skipped_tool "$tool" "Checksum mismatch (auto-skipped in non-interactive mode)" "$url"
+            else
+                SKIPPED_TOOLS+=("$tool")
+            fi
+        fi
+    done
+
+    echo "" >&2
+
+    if [[ "$has_critical" == "true" ]]; then
+        printf "${RED}ABORTING: Critical tools have checksum mismatches: %s${NC}\n" "${critical_names[*]}" >&2
+        printf "Cannot proceed safely without verified critical installers.\n" >&2
+        return 1
+    fi
+
+    printf "${GREEN}Proceeding with installation (non-critical mismatches skipped).${NC}\n" >&2
+    clear_checksum_mismatches
+    return 0
+}
+
+# ============================================================
+# Per-Tool Checksum Mismatch Handler
+# Related: agentic_coding_flywheel_setup-anq
+# ============================================================
+
+# Handle a single checksum mismatch with skip/abort options
+#
+# This function provides immediate per-tool handling when not using
+# batch mode (handle_all_checksum_mismatches).
+#
+# Arguments:
+#   $1 - Tool name
+#   $2 - Expected checksum
+#   $3 - Actual checksum
+#   $4 - URL
+#
+# Environment:
+#   ACFS_INTERACTIVE - "true" for interactive, "false" for non-interactive
+#   ACFS_BATCH_CHECKSUMS - "true" to record for batch handling instead
+#
+# Returns:
+#   0 - Skip this tool, continue installation
+#   1 - Abort installation
+#
+handle_checksum_mismatch() {
+    local tool="$1"
+    local expected="$2"
+    local actual="$3"
+    local url="$4"
+
+    if [[ "${ACFS_STRICT_MODE:-false}" == "true" ]]; then
+        printf "${RED}Security Error:${NC} Checksum mismatch for %s (strict mode)\n" "$tool" >&2
+        printf "  Expected: %s\n" "$expected" >&2
+        printf "  Actual:   %s\n" "$actual" >&2
+        printf "  URL: %s\n" "$url" >&2
+        return 1
+    fi
+
+    # If batch mode is enabled, record and skip (fail closed)
+    if [[ "${ACFS_BATCH_CHECKSUMS:-false}" == "true" ]]; then
+        record_checksum_mismatch "$tool" "$url" "$expected" "$actual"
+        return 0
+    fi
+
+    # Source tools.sh for classification if not already loaded
+    local tools_lib="${SECURITY_SCRIPT_DIR}/tools.sh"
+    if ! declare -f is_critical_tool &>/dev/null && [[ -r "$tools_lib" ]]; then
+        # shellcheck source=tools.sh
+        source "$tools_lib"
+    fi
+
+    local is_critical=false
+    if declare -f is_critical_tool &>/dev/null && is_critical_tool "$tool"; then
+        is_critical=true
+    fi
+
+    # Non-interactive mode
+    if ! _acfs_is_interactive; then
+        if [[ "$is_critical" == "true" ]]; then
+            echo -e "${RED}CRITICAL tool $tool has checksum mismatch - aborting${NC}" >&2
+            return 1  # Abort
+        else
+            echo -e "${YELLOW}Skipping $tool (checksum mismatch, non-interactive)${NC}" >&2
+            if declare -f record_skipped_tool &>/dev/null; then
+                record_skipped_tool "$tool" "Checksum mismatch (auto-skipped)" "$url"
+            else
+                SKIPPED_TOOLS+=("$tool")
+            fi
+            return 0  # Skip
+        fi
+    fi
+
+    # Interactive mode: show details and prompt
+    echo "" >&2
+    printf "${YELLOW}━━━ Checksum Mismatch: %s ━━━${NC}\n" "$tool" >&2
+    echo "" >&2
+
+    local classification_label
+    if [[ "$is_critical" == "true" ]]; then
+        classification_label="${RED}[CRITICAL]${NC}"
+    else
+        classification_label="${YELLOW}[optional]${NC}"
+    fi
+
+    printf "  Tool: %b %s\n" "$classification_label" "$tool" >&2
+    printf "  Expected: %.16s...\n" "$expected" >&2
+    printf "  Actual:   %.16s...\n" "$actual" >&2
+    printf "  URL: %s\n" "$url" >&2
+    echo "" >&2
+    echo "This usually means the upstream script was updated." >&2
+    echo "" >&2
+
+    if [[ "$is_critical" == "true" ]]; then
+        printf "${RED}ABORTING:${NC} %s is CRITICAL and its installer checksum changed.\n" "$tool" >&2
+        printf "Update ACFS/checksums.yaml and re-run to proceed safely.\n" >&2
+        return 1
+    fi
+
+    echo "Options:" >&2
+    echo "  [S] Skip this tool" >&2
+    echo "  [A] Abort installation" >&2
+    echo "" >&2
+
+    local choice
+    if [[ -t 0 ]]; then
+        read -r -p "Choice [s/A]: " choice < /dev/tty
+    elif [[ -r /dev/tty ]]; then
+        read -r -p "Choice [s/A]: " choice < /dev/tty
+    else
+        choice=""
+    fi
+
+    case "${choice,,}" in
+        s|skip)
+            if declare -f record_skipped_tool &>/dev/null; then
+                record_skipped_tool "$tool" "Checksum mismatch (user chose to skip)" "$url"
+            else
+                SKIPPED_TOOLS+=("$tool")
+            fi
+            return 0  # Skip
+            ;;
+        a|abort|"")
+            echo -e "${RED}Installation aborted by user.${NC}" >&2
+            return 1  # Abort
+            ;;
+        *)
+            echo "Invalid choice. Aborting for safety." >&2
+            return 1  # Abort
+            ;;
+    esac
+}
+
+# Check installer and record mismatch if found
+#
+# Arguments:
+#   $1 - Tool name
+#   $2 - URL (optional, uses KNOWN_INSTALLERS if not provided)
+#   $3 - Expected checksum (optional, uses LOADED_CHECKSUMS if not provided)
+#
+# Returns:
+#   0 - Checksum matches
+#   1 - Checksum mismatch (recorded for later batched handling)
+#   2 - Fetch error
+#
+check_installer_checksum() {
+    local tool="$1"
+    local url="${2:-${KNOWN_INSTALLERS[$tool]:-}}"
+    local expected="${3:-${LOADED_CHECKSUMS[$tool]:-}}"
+
+    if [[ -z "$url" ]]; then
+        echo "Warning: No URL for tool $tool" >&2
+        return 2
+    fi
+
+    if [[ -z "$expected" ]]; then
+        echo "Warning: No expected checksum for $tool" >&2
+        return 2
+    fi
+
+    local actual
+    actual=$(fetch_checksum "$url" 2>/dev/null) || {
+        echo "Warning: Failed to fetch $tool from $url" >&2
+        return 2
+    }
+
+    if [[ "$actual" != "$expected" ]]; then
+        record_checksum_mismatch "$tool" "$url" "$expected" "$actual"
+        return 1
+    fi
+
+    return 0
+}
+
+# ============================================================
+# Verification Report
+# ============================================================
+
+# Verify all known installers and report
+verify_all_installers() {
+    local all_pass=true
+    local verified=0
+    local failed=0
+
+    echo ""
+    printf "${CYAN}Verifying Installer Integrity${NC}\n"
+    echo "============================================================"
+    echo ""
+
+    for name in "${!KNOWN_INSTALLERS[@]}"; do
+        local url="${KNOWN_INSTALLERS[$name]}"
+        local expected="${LOADED_CHECKSUMS[$name]:-}"
+
+        printf "  %-20s " "$name"
+
+        if [[ -z "$expected" ]]; then
+            echo -e "${YELLOW}[skip]${NC} no checksum recorded"
+            continue
+        fi
+
+        local actual
+        actual=$(fetch_checksum "$url" 2>/dev/null) || {
+            echo -e "${RED}[fail]${NC} fetch error"
+            ((failed += 1))
+            all_pass=false
+            continue
+        }
+
+        if [[ "$actual" == "$expected" ]]; then
+            echo -e "${GREEN}[ok]${NC}"
+            ((verified += 1))
+        else
+            echo -e "${RED}[fail]${NC} checksum changed"
+            ((failed += 1))
+            all_pass=false
+        fi
+    done
+
+    echo ""
+    echo "------------------------------------------------------------"
+    echo -e "Verified: $verified, Failed: $failed"
+
+    if [[ "$all_pass" == "true" ]]; then
+        echo -e "${GREEN}All installer checksums verified.${NC}"
+        return 0
+    else
+        echo -e "${YELLOW}Some checksums failed or changed.${NC}"
+        echo "This may indicate:"
+        echo "  - Upstream scripts were updated (normal)"
+        echo "  - Potential security issue (rare)"
+        echo ""
+        echo "To update checksums after review:"
+        echo "  ./scripts/lib/security.sh --update-checksums > checksums.yaml"
+        return 1
+    fi
+}
+
+# Verify all known installers and output as JSON
+# Usage: verify_all_installers_json
+# Output: JSON object with matches, mismatches, and errors arrays
+verify_all_installers_json() {
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Arrays to collect results
+    local matches=()
+    local mismatches=()
+    local errors=()
+    local skipped=()
+    local total=0
+
+    # Helper function to escape strings for JSON
+    _json_escape() {
+        local s="$1"
+        s="${s//\\/\\\\}" # escape backslashes
+        s="${s//\"/\\\"}" # escape quotes
+        s="${s//$'\n'/\\n}" # escape newlines
+        s="${s//$'\r'/\\r}" # escape CR
+        s="${s//$'\t'/\\t}" # escape tabs
+        # Also escape control characters (0x00-0x1F)
+        # shellcheck disable=SC1003
+        s=$(printf '%s' "$s" | tr '\000-\037' ' ')
+        printf '%s' "$s"
+    }
+
+    for name in "${!KNOWN_INSTALLERS[@]}"; do
+        local url="${KNOWN_INSTALLERS[$name]}"
+        local expected="${LOADED_CHECKSUMS[$name]:-}"
+        total=$((total + 1))
+
+        if [[ -z "$expected" ]]; then
+            skipped+=("{\"name\":\"$(_json_escape "$name")\",\"reason\":\"no checksum recorded\"}")
+            continue
+        fi
+
+        local actual=""
+        local fetch_error=""
+        local tmp_err=""
+
+        # Create temp file for stderr capture
+        # Fallback to empty if mktemp fails (no capture), do NOT use predictable /tmp paths.
+        if command -v mktemp &>/dev/null; then
+            tmp_err=$(mktemp 2>/dev/null) || tmp_err=""
+        else
+            tmp_err=""
+        fi
+
+        # Capture stdout to variable, stderr to file (if tmp_err exists)
+        if [[ -n "$tmp_err" ]]; then
+            if actual=$(fetch_checksum "$url" 2>"$tmp_err"); then
+                # Success
+                :
+            else
+                # Failure
+                fetch_error=$(cat "$tmp_err")
+                [[ -z "$fetch_error" ]] && fetch_error="Unknown error fetching checksum"
+            fi
+            rm -f "$tmp_err"
+        else
+            # Fallback: capture combined output or lose stderr if we can't separate them safely
+            # without a temp file. Here we prioritize safety over error details.
+            if actual=$(fetch_checksum "$url" 2>/dev/null); then
+                :
+            else
+                fetch_error="Unknown error (mktemp failed, stderr unavailable)"
+            fi
+        fi
+
+        if [[ -n "$fetch_error" ]]; then
+            local escaped_error
+            escaped_error=$(_json_escape "$fetch_error")
+            errors+=("{\"name\":\"$(_json_escape "$name")\",\"url\":\"$(_json_escape "$url")\",\"error\":\"$escaped_error\"}")
+        elif [[ "$actual" == "$expected" ]]; then
+            matches+=("{\"name\":\"$(_json_escape "$name")\",\"checksum\":\"$expected\"}")
+        else
+            mismatches+=("{\"name\":\"$(_json_escape "$name")\",\"url\":\"$(_json_escape "$url")\",\"expected\":\"$expected\",\"actual\":\"$actual\"}")
+        fi
+    done
+
+    # Build JSON output
+    echo "{"
+    echo "  \"timestamp\": \"$timestamp\","
+    echo "  \"total\": $total,"
+
+    # Matches array
+    echo "  \"matches\": ["
+    local first=true
+    for item in "${matches[@]}"; do
+        if [[ "$first" == "true" ]]; then
+            first=false
+        else
+            echo ","
+        fi
+        echo -n "    $item"
+    done
+    if [[ ${#matches[@]} -gt 0 ]]; then echo; fi
+    echo "  ],"
+
+    # Mismatches array
+    echo "  \"mismatches\": ["
+    first=true
+    for item in "${mismatches[@]}"; do
+        if [[ "$first" == "true" ]]; then
+            first=false
+        else
+            echo ","
+        fi
+        echo -n "    $item"
+    done
+    if [[ ${#mismatches[@]} -gt 0 ]]; then echo; fi
+    echo "  ],"
+
+    # Errors array
+    echo "  \"errors\": ["
+    first=true
+    for item in "${errors[@]}"; do
+        if [[ "$first" == "true" ]]; then
+            first=false
+        else
+            echo ","
+        fi
+        echo -n "    $item"
+    done
+    if [[ ${#errors[@]} -gt 0 ]]; then echo; fi
+    echo "  ],"
+
+    # Skipped array
+    echo "  \"skipped\": ["
+    first=true
+    for item in "${skipped[@]}"; do
+        if [[ "$first" == "true" ]]; then
+            first=false
+        else
+            echo ","
+        fi
+        echo -n "    $item"
+    done
+    if [[ ${#skipped[@]} -gt 0 ]]; then echo; fi
+    echo "  ]"
+
+    echo "}"
+
+    # Return non-zero if there are mismatches or errors
+    if [[ ${#mismatches[@]} -gt 0 || ${#errors[@]} -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# ============================================================
+# CLI Interface
+# ============================================================
+
+usage() {
+    cat << 'EOF'
+security.sh - ACFS Installer Security Verification
+
+Usage:
+  security.sh [command] [options]
+
+Commands:
+  --print              Print all upstream URLs
+  --update-checksums   Generate checksums.yaml content
+  --verify             Verify all installers against saved checksums
+  --checksum URL       Calculate SHA256 of a URL
+  --help               Show this help
+
+Options:
+  --json               Output in JSON format (use with --verify)
+
+Examples:
+  ./security.sh --print
+  ./security.sh --update-checksums > checksums.yaml
+  ./security.sh --verify
+  ./security.sh --verify --json
+  ./security.sh --checksum https://bun.sh/install
+EOF
+}
+
+main() {
+    local json_output=false
+
+    # Parse --json flag if present
+    for arg in "$@"; do
+        if [[ "$arg" == "--json" ]]; then
+            json_output=true
+        fi
+    done
+
+    case "${1:-}" in
+        --print)
+            print_upstream_urls
+            ;;
+        --update-checksums)
+            print_current_checksums
+            ;;
+        --verify)
+            load_checksums
+            if [[ "$json_output" == "true" ]]; then
+                verify_all_installers_json
+            else
+                verify_all_installers
+            fi
+            ;;
+        --checksum)
+            if [[ -z "${2:-}" ]]; then
+                echo "Usage: security.sh --checksum URL" >&2
+                exit 1
+            fi
+            fetch_checksum "$2"
+            ;;
+        --help|-h)
+            usage
+            ;;
+        "")
+            usage
+            ;;
+        *)
+            echo "Unknown command: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Run if executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    set -euo pipefail
+    main "$@"
+fi

@@ -1,0 +1,666 @@
+#!/usr/bin/env bash
+# ============================================================
+# ACFS Global Wrapper
+# Installed to /usr/local/bin/acfs for system-wide access
+#
+# This wrapper ensures the acfs command works regardless of
+# which user invokes it (root or target user).
+# ============================================================
+
+set -euo pipefail
+
+# Optional override for state file location.
+# If unset, we auto-detect from common install locations.
+ACFS_STATE_FILE="${ACFS_STATE_FILE:-}"
+ACFS_SYSTEM_STATE_FILE="${ACFS_SYSTEM_STATE_FILE:-/var/lib/acfs/state.json}"
+
+sanitize_abs_nonroot_path() {
+    local path_value="${1:-}"
+
+    [[ -n "$path_value" ]] || return 1
+    path_value="${path_value%/}"
+    [[ -n "$path_value" ]] || return 1
+    [[ "$path_value" == /* ]] || return 1
+    [[ "$path_value" != "/" ]] || return 1
+    printf '%s\n' "$path_value"
+}
+
+is_valid_username() {
+    local username="$1"
+    [[ "$username" =~ ^[a-z_][a-z0-9._-]*$ ]]
+}
+
+validate_target_user_or_die() {
+    local user="${1:-}"
+    local display="${user:-<empty>}"
+    if is_valid_username "$user"; then
+        return 0
+    fi
+    echo "Error: invalid TARGET_USER '$display' (expected: lowercase user name like 'ubuntu')" >&2
+    exit 1
+}
+
+resolve_home_for_user() {
+    local user="$1"
+    local user_home=""
+
+    if [[ "$user" == "root" ]]; then
+        printf '/root\n'
+        return 0
+    fi
+
+    user_home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)" || true
+    user_home="$(sanitize_abs_nonroot_path "$user_home" 2>/dev/null || true)"
+    if [[ -n "$user_home" ]]; then
+        printf '%s\n' "$user_home"
+        return 0
+    fi
+
+    return 1
+}
+
+resolve_current_home() {
+    local current_user=""
+    local home_candidate=""
+
+    home_candidate="$(sanitize_abs_nonroot_path "${HOME:-}" 2>/dev/null || true)"
+    if [[ -n "$home_candidate" ]]; then
+        printf '%s\n' "$home_candidate"
+        return 0
+    fi
+
+    current_user="$(id -un 2>/dev/null || whoami 2>/dev/null || true)"
+    if [[ -n "$current_user" ]]; then
+        home_candidate="$(resolve_home_for_user "$current_user" 2>/dev/null || true)"
+        if [[ -n "$home_candidate" ]]; then
+            printf '%s\n' "$home_candidate"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+read_target_user_from_state_file() {
+    local state_file="$1"
+    local target_user=""
+
+    [[ -f "$state_file" ]] || return 1
+
+    # Try jq first (faster and more reliable)
+    if command -v jq &>/dev/null; then
+        target_user="$(jq -r '.target_user // empty' "$state_file" 2>/dev/null || true)"
+    fi
+
+    # Fall back to sed if jq not available / parse fails
+    if [[ -z "$target_user" ]]; then
+        target_user="$(sed -n 's/.*"target_user"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)"
+    fi
+
+    if [[ -n "$target_user" ]] && is_valid_username "$target_user"; then
+        printf '%s\n' "$target_user"
+        return 0
+    fi
+
+    return 1
+}
+
+read_target_home_from_state_file() {
+    local state_file="$1"
+    local target_home=""
+
+    [[ -f "$state_file" ]] || return 1
+
+    if command -v jq &>/dev/null; then
+        target_home="$(jq -r '.target_home // empty' "$state_file" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$target_home" ]]; then
+        target_home="$(sed -n 's/.*"target_home"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)"
+    fi
+
+    if [[ -n "$target_home" ]] && [[ "$target_home" == /* ]] && [[ "$target_home" != "/" ]]; then
+        printf '%s\n' "${target_home%/}"
+        return 0
+    fi
+
+    return 1
+}
+
+read_bin_dir_from_state_file() {
+    local state_file="$1"
+    local bin_dir=""
+
+    [[ -f "$state_file" ]] || return 1
+
+    if command -v jq &>/dev/null; then
+        bin_dir="$(jq -r '.bin_dir // empty' "$state_file" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$bin_dir" ]]; then
+        bin_dir="$(sed -n 's/.*"bin_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)"
+    fi
+
+    if [[ -n "$bin_dir" ]] && [[ "$bin_dir" == /* ]] && [[ "$bin_dir" != "/" ]]; then
+        printf '%s\n' "${bin_dir%/}"
+        return 0
+    fi
+
+    return 1
+}
+
+find_acfs_bin_from_state_file() {
+    local state_file="$1"
+    local state_home=""
+    local target_home=""
+    local target_user=""
+    local candidate_bin=""
+
+    [[ -f "$state_file" ]] || return 1
+
+    if [[ "$state_file" == */.acfs/state.json ]]; then
+        state_home="${state_file%/.acfs/state.json}"
+        state_home="${state_home%/}"
+        if [[ -n "$state_home" ]] && [[ "$state_home" == /* ]] && [[ "$state_home" != "/" ]]; then
+            candidate_bin="$(find_acfs_bin_for_home "$state_home" 2>/dev/null || true)"
+            if [[ -n "$candidate_bin" ]]; then
+                printf '%s\n' "$candidate_bin"
+                return 0
+            fi
+
+            # For home-adjacent state files, the path is a stronger signal than
+            # any embedded target_user copied from another install.
+            return 1
+        fi
+    fi
+
+    target_home="$(read_target_home_from_state_file "$state_file" 2>/dev/null || true)"
+    if [[ -n "$target_home" ]]; then
+        candidate_bin="$(find_acfs_bin_for_home "$target_home" 2>/dev/null || true)"
+        if [[ -n "$candidate_bin" ]]; then
+            printf '%s\n' "$candidate_bin"
+            return 0
+        fi
+    fi
+
+    target_user="$(read_target_user_from_state_file "$state_file" 2>/dev/null || true)"
+    [[ -n "$target_user" ]] || return 1
+    find_acfs_bin "$target_user"
+}
+
+find_acfs_bin_for_home() {
+    local user_home="$1"
+
+    user_home="$(sanitize_abs_nonroot_path "$user_home" 2>/dev/null || true)"
+    [[ -n "$user_home" ]] || return 1
+
+    if [[ -x "$user_home/.local/bin/acfs" ]]; then
+        printf '%s\n' "$user_home/.local/bin/acfs"
+        return 0
+    fi
+
+    if [[ -x "$user_home/.acfs/bin/acfs" ]]; then
+        printf '%s\n' "$user_home/.acfs/bin/acfs"
+        return 0
+    fi
+
+    return 1
+}
+
+home_from_acfs_bin() {
+    local acfs_bin="$1"
+    local user_home=""
+
+    [[ -n "$acfs_bin" ]] || return 1
+
+    case "$acfs_bin" in
+        */.local/bin/acfs)
+            user_home="${acfs_bin%/.local/bin/acfs}"
+            ;;
+        */.acfs/bin/acfs)
+            user_home="${acfs_bin%/.acfs/bin/acfs}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    [[ -n "$user_home" ]] || return 1
+    [[ "$user_home" == /* ]] || return 1
+    [[ "$user_home" != "/" ]] || return 1
+    printf '%s\n' "${user_home%/}"
+}
+
+prepare_runtime_context_from_home() {
+    local user_home="$1"
+    local sanitized_bin_dir=""
+
+    user_home="$(sanitize_abs_nonroot_path "$user_home" 2>/dev/null || true)"
+    [[ -n "$user_home" ]] || return 1
+
+    TARGET_HOME="$user_home"
+    ACFS_HOME="$user_home/.acfs"
+    ACFS_STATE_FILE="$ACFS_HOME/state.json"
+    sanitized_bin_dir="$(sanitize_abs_nonroot_path "${ACFS_BIN_DIR:-}" 2>/dev/null || true)"
+    ACFS_BIN_DIR="${sanitized_bin_dir:-}"
+    if [[ -z "${ACFS_BIN_DIR:-}" ]]; then
+        ACFS_BIN_DIR="$(read_bin_dir_from_state_file "$ACFS_STATE_FILE" 2>/dev/null || true)"
+    fi
+
+    export TARGET_HOME ACFS_HOME ACFS_STATE_FILE ACFS_BIN_DIR
+}
+
+read_user_for_home() {
+    local user_home="$1"
+    local candidate_user=""
+    local state_file=""
+    local state_home=""
+
+    user_home="$(sanitize_abs_nonroot_path "$user_home" 2>/dev/null || true)"
+    [[ -n "$user_home" ]] || return 1
+    state_file="$user_home/.acfs/state.json"
+
+    candidate_user="$(
+        getent passwd 2>/dev/null \
+            | awk -F: -v home="$user_home" '$6 == home { print $1; exit }'
+    )" || true
+    if [[ -n "$candidate_user" ]] && is_valid_username "$candidate_user"; then
+        printf '%s\n' "$candidate_user"
+        return 0
+    fi
+
+    if command -v stat >/dev/null 2>&1; then
+        candidate_user="$(stat -c '%U' "$user_home" 2>/dev/null || true)"
+        if [[ -n "$candidate_user" ]] && [[ "$candidate_user" != "UNKNOWN" ]] && is_valid_username "$candidate_user"; then
+            printf '%s\n' "$candidate_user"
+            return 0
+        fi
+    fi
+
+    candidate_user="$(read_target_user_from_state_file "$state_file" 2>/dev/null || true)"
+    [[ -n "$candidate_user" ]] || return 1
+
+    state_home="$(read_target_home_from_state_file "$state_file" 2>/dev/null || true)"
+    if [[ -z "$state_home" ]]; then
+        state_home="$(getent passwd "$candidate_user" 2>/dev/null | cut -d: -f6)" || true
+        state_home="${state_home%/}"
+    fi
+
+    if [[ -n "$state_home" ]] && [[ "$state_home" == "$user_home" ]]; then
+        printf '%s\n' "$candidate_user"
+        return 0
+    fi
+
+    return 1
+}
+
+read_target_user_from_state_hint() {
+    local state_file="$1"
+    local candidate_user=""
+    local state_home=""
+
+    [[ -f "$state_file" ]] || return 1
+
+    if [[ "$state_file" == */.acfs/state.json ]]; then
+        state_home="${state_file%/.acfs/state.json}"
+        state_home="${state_home%/}"
+        if [[ -n "$state_home" ]] && [[ "$state_home" == /* ]] && [[ "$state_home" != "/" ]]; then
+            candidate_user="$(read_user_for_home "$state_home" 2>/dev/null || true)"
+            if [[ -n "$candidate_user" ]] && find_acfs_bin_for_home "$state_home" >/dev/null 2>&1; then
+                printf '%s\n' "$candidate_user"
+                return 0
+            fi
+
+            # For home-adjacent state files, refuse to trust mismatched target_user
+            # values from stale copies. The path itself is the stronger signal.
+            return 1
+        fi
+    fi
+
+    state_home="$(read_target_home_from_state_file "$state_file" 2>/dev/null || true)"
+    if [[ -n "$state_home" ]] && [[ "$state_home" == /* ]] && [[ "$state_home" != "/" ]]; then
+        candidate_user="$(read_user_for_home "$state_home" 2>/dev/null || true)"
+        if [[ -z "$candidate_user" ]]; then
+            candidate_user="$(read_target_user_from_state_file "$state_file" 2>/dev/null || true)"
+        fi
+        if [[ -n "$candidate_user" ]] && find_acfs_bin_for_home "$state_home" >/dev/null 2>&1; then
+            printf '%s\n' "$candidate_user"
+            return 0
+        fi
+    fi
+
+    candidate_user="$(read_target_user_from_state_file "$state_file" 2>/dev/null || true)"
+    if [[ -n "$candidate_user" ]] && find_acfs_bin "$candidate_user" >/dev/null 2>&1; then
+        printf '%s\n' "$candidate_user"
+        return 0
+    fi
+
+    return 1
+}
+
+# Find acfs installation for a user
+find_acfs_bin() {
+    local user="$1"
+    local user_home=""
+    local current_user=""
+
+    user_home="$(resolve_home_for_user "$user" || true)"
+    if [[ -n "$user_home" ]] && find_acfs_bin_for_home "$user_home" >/dev/null 2>&1; then
+        find_acfs_bin_for_home "$user_home"
+        return 0
+    fi
+
+    current_user="$(id -un 2>/dev/null || whoami 2>/dev/null || true)"
+    if [[ "$current_user" == "$user" ]] && [[ -n "${HOME:-}" ]] && [[ "${HOME}" == /* ]]; then
+        user_home="${HOME%/}"
+        if find_acfs_bin_for_home "$user_home" >/dev/null 2>&1; then
+            find_acfs_bin_for_home "$user_home"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+find_installed_acfs_owner() {
+    local current_user=""
+    local candidate_user=""
+    local candidate_home=""
+
+    current_user="$(whoami 2>/dev/null || true)"
+    if [[ -n "$current_user" ]] && find_acfs_bin "$current_user" >/dev/null 2>&1; then
+        printf '%s\n' "$current_user"
+        return 0
+    fi
+
+    while IFS=: read -r candidate_user _ _ _ _ candidate_home _; do
+        [[ -n "$candidate_user" ]] || continue
+        [[ -n "$candidate_home" ]] || continue
+        [[ "$candidate_home" == /* ]] || continue
+        if find_acfs_bin_for_home "$candidate_home" >/dev/null 2>&1; then
+            printf '%s\n' "$candidate_user"
+            return 0
+        fi
+    done < <(getent passwd 2>/dev/null || true)
+
+    return 1
+}
+
+# Detect target user from state file(s) or installed homes.
+detect_target_user() {
+    local current_user=""
+    local state_candidate=""
+    local candidate_user=""
+    local candidate_home=""
+    local acfs_home="${ACFS_HOME:-}"
+    local current_home=""
+
+    current_home="$(resolve_current_home 2>/dev/null || true)"
+
+    current_user="$(whoami 2>/dev/null || true)"
+    if [[ -n "$current_user" ]] && find_acfs_bin "$current_user" >/dev/null 2>&1; then
+        printf '%s\n' "$current_user"
+        return 0
+    fi
+
+    if [[ -n "$acfs_home" ]]; then
+        acfs_home="${acfs_home%/}"
+        if [[ "$acfs_home" == */.acfs ]]; then
+            candidate_home="${acfs_home%/.acfs}"
+            candidate_user="$(read_user_for_home "$candidate_home" 2>/dev/null || true)"
+            if [[ -n "$candidate_user" ]] && find_acfs_bin_for_home "$candidate_home" >/dev/null 2>&1; then
+                printf '%s\n' "$candidate_user"
+                return 0
+            fi
+        fi
+        candidate_user="$(read_target_user_from_state_hint "$acfs_home/state.json" 2>/dev/null || true)"
+        if [[ -n "$candidate_user" ]]; then
+            printf '%s\n' "$candidate_user"
+            return 0
+        fi
+    fi
+
+    if [[ -n "${ACFS_STATE_FILE:-}" ]]; then
+        candidate_user="$(read_target_user_from_state_hint "$ACFS_STATE_FILE" 2>/dev/null || true)"
+        if [[ -n "$candidate_user" ]]; then
+            printf '%s\n' "$candidate_user"
+            return 0
+        fi
+    fi
+
+    if [[ -n "$current_home" ]]; then
+        candidate_user="$(read_target_user_from_state_hint "$current_home/.acfs/state.json" 2>/dev/null || true)"
+        if [[ -n "$candidate_user" ]]; then
+            printf '%s\n' "$candidate_user"
+            return 0
+        fi
+    fi
+
+    while IFS=: read -r _ _ _ _ _ candidate_home _; do
+        [[ -n "$candidate_home" ]] || continue
+        [[ "$candidate_home" == /* ]] || continue
+        state_candidate="$candidate_home/.acfs/state.json"
+        candidate_user="$(read_target_user_from_state_hint "$state_candidate" 2>/dev/null || true)"
+        if [[ -n "$candidate_user" ]]; then
+            printf '%s\n' "$candidate_user"
+            return 0
+        fi
+    done < <(getent passwd 2>/dev/null || true)
+
+    candidate_user="$(read_target_user_from_state_hint "$ACFS_SYSTEM_STATE_FILE" 2>/dev/null || true)"
+    if [[ -n "$candidate_user" ]]; then
+        printf '%s\n' "$candidate_user"
+        return 0
+    fi
+
+    candidate_user="$(find_installed_acfs_owner 2>/dev/null || true)"
+    if [[ -n "$candidate_user" ]]; then
+        printf '%s\n' "$candidate_user"
+        return 0
+    fi
+
+    return 1
+}
+
+main() {
+    local target_user
+    local acfs_bin=""
+    local current_user
+    local runtime_home=""
+    local runtime_user=""
+    local candidate_bin=""
+    local direct_acfs_home=""
+    local current_home=""
+    local -a state_candidates=()
+
+    current_home="$(resolve_current_home 2>/dev/null || true)"
+    if [[ -n "$current_home" ]]; then
+        HOME="$current_home"
+        export HOME
+    fi
+
+    ACFS_STATE_FILE="$(sanitize_abs_nonroot_path "${ACFS_STATE_FILE:-}" 2>/dev/null || true)"
+    ACFS_SYSTEM_STATE_FILE="$(sanitize_abs_nonroot_path "${ACFS_SYSTEM_STATE_FILE:-}" 2>/dev/null || true)"
+    ACFS_HOME="$(sanitize_abs_nonroot_path "${ACFS_HOME:-}" 2>/dev/null || true)"
+    TARGET_HOME="$(sanitize_abs_nonroot_path "${TARGET_HOME:-}" 2>/dev/null || true)"
+    ACFS_BIN_DIR="$(sanitize_abs_nonroot_path "${ACFS_BIN_DIR:-}" 2>/dev/null || true)"
+    export ACFS_STATE_FILE ACFS_SYSTEM_STATE_FILE ACFS_HOME TARGET_HOME ACFS_BIN_DIR
+
+    target_user="$(detect_target_user || true)"
+    current_user="$(whoami)"
+
+    # Find the acfs binary
+    if [[ -n "${ACFS_HOME:-}" ]] && [[ "${ACFS_HOME}" == */.acfs ]]; then
+        candidate_bin="$(find_acfs_bin_for_home "${ACFS_HOME%/.acfs}" 2>/dev/null || true)"
+        [[ -n "$candidate_bin" ]] && acfs_bin="$candidate_bin"
+    fi
+
+    if [[ -z "$acfs_bin" ]] && [[ -n "${ACFS_STATE_FILE:-}" ]]; then
+        candidate_bin="$(find_acfs_bin_from_state_file "$ACFS_STATE_FILE" 2>/dev/null || true)"
+        [[ -n "$candidate_bin" ]] && acfs_bin="$candidate_bin"
+    fi
+
+    if [[ -z "$acfs_bin" ]] && [[ -n "$current_home" ]]; then
+        candidate_bin="$(find_acfs_bin_from_state_file "$current_home/.acfs/state.json" 2>/dev/null || true)"
+        [[ -n "$candidate_bin" ]] && acfs_bin="$candidate_bin"
+    fi
+
+    if [[ -z "$acfs_bin" ]] && [[ -n "${ACFS_SYSTEM_STATE_FILE:-}" ]]; then
+        candidate_bin="$(find_acfs_bin_from_state_file "$ACFS_SYSTEM_STATE_FILE" 2>/dev/null || true)"
+        [[ -n "$candidate_bin" ]] && acfs_bin="$candidate_bin"
+    fi
+
+    if [[ -z "$acfs_bin" ]]; then
+        acfs_bin="$(find_acfs_bin "$target_user" || true)"
+    fi
+
+    if [[ -z "$acfs_bin" ]]; then
+        local target_home=""
+        if [[ -n "$target_user" ]]; then
+            echo "Error: ACFS not found for user '$target_user'" >&2
+            target_home="$(resolve_home_for_user "$target_user" || true)"
+        else
+            echo "Error: ACFS not found." >&2
+        fi
+
+        if [[ -n "$target_home" ]]; then
+            echo "Expected at: $target_home/.local/bin/acfs (or $target_home/.acfs/bin/acfs)" >&2
+        elif [[ -n "$target_user" ]]; then
+            echo "Unable to determine an exact home directory for user '$target_user'." >&2
+            echo "Provide ACFS_STATE_FILE/ACFS_SYSTEM_STATE_FILE with target_home, or re-run from the installed ACFS tree." >&2
+        else
+            echo "Unable to determine the ACFS owner automatically." >&2
+            echo "Provide ACFS_STATE_FILE/ACFS_SYSTEM_STATE_FILE with target_home, or re-run from the installed ACFS tree." >&2
+        fi
+
+        local candidate_home=""
+        local candidate_user=""
+        local candidate_bin=""
+        local found_candidates=0
+
+        while IFS=: read -r candidate_user _ _ _ _ candidate_home _; do
+            [[ -n "$candidate_user" ]] || continue
+            [[ -n "$candidate_home" ]] || continue
+            [[ "$candidate_home" == /* ]] || continue
+            candidate_bin="$(find_acfs_bin_for_home "$candidate_home" 2>/dev/null || true)"
+            [[ -n "$candidate_bin" ]] || continue
+            if (( found_candidates == 0 )); then
+                echo "" >&2
+                echo "Detected other ACFS installs:" >&2
+            fi
+            found_candidates=1
+            echo "  - $candidate_user: $candidate_bin" >&2
+            echo "    Try: sudo -u \"$candidate_user\" -H -- \"$0\" [args...]" >&2
+        done < <(getent passwd 2>/dev/null || true)
+
+        echo "" >&2
+        echo "If ACFS was installed for a different user, run this wrapper as that user, e.g.:" >&2
+        echo "  sudo -u <user> -H -- \"$0\" [args...]" >&2
+        echo "" >&2
+        echo "You can also override state discovery:" >&2
+        echo "  ACFS_STATE_FILE=/path/to/state.json \"$0\" [args...]" >&2
+        exit 1
+    fi
+
+    runtime_home="$(home_from_acfs_bin "$acfs_bin" 2>/dev/null || true)"
+    if [[ -n "$runtime_home" ]]; then
+        prepare_runtime_context_from_home "$runtime_home"
+        runtime_user="$(read_user_for_home "$runtime_home" 2>/dev/null || true)"
+        if [[ -n "$runtime_user" ]]; then
+            target_user="$runtime_user"
+        fi
+    fi
+
+    if [[ -n "$target_user" ]]; then
+        validate_target_user_or_die "$target_user"
+    fi
+
+    if [[ -z "${ACFS_BIN_DIR:-}" ]]; then
+        local state_candidate=""
+        state_candidates=(
+            "${ACFS_STATE_FILE:-}"
+            "${ACFS_SYSTEM_STATE_FILE:-}"
+        )
+        [[ -n "$current_home" ]] && state_candidates+=("$current_home/.acfs/state.json")
+        for state_candidate in "${state_candidates[@]}"; do
+            [[ -n "$state_candidate" && -f "$state_candidate" ]] || continue
+            ACFS_BIN_DIR="$(read_bin_dir_from_state_file "$state_candidate" 2>/dev/null || true)"
+            [[ -n "$ACFS_BIN_DIR" ]] && break
+        done
+        export ACFS_BIN_DIR
+    fi
+
+    exec_as_target_user() {
+        local user="$1"
+        shift
+        local -a env_args=()
+        local sanitized_state_file=""
+        local sanitized_system_state_file=""
+        local sanitized_target_home=""
+        local sanitized_acfs_home=""
+        local sanitized_bin_dir=""
+
+        sanitized_state_file="$(sanitize_abs_nonroot_path "${ACFS_STATE_FILE:-}" 2>/dev/null || true)"
+        sanitized_system_state_file="$(sanitize_abs_nonroot_path "${ACFS_SYSTEM_STATE_FILE:-}" 2>/dev/null || true)"
+        sanitized_target_home="$(sanitize_abs_nonroot_path "${TARGET_HOME:-}" 2>/dev/null || true)"
+        sanitized_acfs_home="$(sanitize_abs_nonroot_path "${ACFS_HOME:-}" 2>/dev/null || true)"
+        sanitized_bin_dir="$(sanitize_abs_nonroot_path "${ACFS_BIN_DIR:-}" 2>/dev/null || true)"
+
+        validate_target_user_or_die "$user"
+
+        [[ -n "$sanitized_state_file" ]] && env_args+=("ACFS_STATE_FILE=$sanitized_state_file")
+        [[ -n "$sanitized_system_state_file" ]] && env_args+=("ACFS_SYSTEM_STATE_FILE=$sanitized_system_state_file")
+        [[ -n "$sanitized_target_home" ]] && env_args+=("TARGET_HOME=$sanitized_target_home")
+        [[ -n "$sanitized_acfs_home" ]] && env_args+=("ACFS_HOME=$sanitized_acfs_home")
+        [[ -n "$sanitized_bin_dir" ]] && env_args+=("ACFS_BIN_DIR=$sanitized_bin_dir")
+        [[ -n "${ACFS_REF:-}" ]] && env_args+=("ACFS_REF=$ACFS_REF")
+        [[ -n "${ACFS_RAW:-}" ]] && env_args+=("ACFS_RAW=$ACFS_RAW")
+
+        local cmd_with_env
+        if [[ ${#env_args[@]} -gt 0 ]]; then
+            cmd_with_env=("env" "${env_args[@]}" "$@")
+        else
+            cmd_with_env=("$@")
+        fi
+
+        if [[ "$EUID" -eq 0 ]]; then
+            if command -v runuser >/dev/null 2>&1; then
+                exec runuser -u "$user" -- "${cmd_with_env[@]}"
+            fi
+            if command -v sudo >/dev/null 2>&1; then
+                exec sudo -u "$user" -H "${cmd_with_env[@]}"
+            fi
+            echo "Error: need runuser or sudo to run acfs as '$user'" >&2
+            exit 1
+        fi
+
+        if ! command -v sudo >/dev/null 2>&1; then
+            echo "Error: need sudo to run acfs as '$user'" >&2
+            exit 1
+        fi
+
+        echo "Note: Running acfs as '$user' (ACFS owner)" >&2
+        exec sudo -u "$user" -H "${cmd_with_env[@]}"
+    }
+
+    # If owner detection failed or we're already the target user, run directly
+    if [[ -z "$target_user" || "$current_user" == "$target_user" ]]; then
+        if [[ -n "${TARGET_HOME:-}" ]]; then
+            direct_acfs_home="$(sanitize_abs_nonroot_path "${ACFS_HOME:-$TARGET_HOME/.acfs}" 2>/dev/null || true)"
+            exec env \
+                HOME="$TARGET_HOME" \
+                TARGET_HOME="$TARGET_HOME" \
+                ACFS_HOME="${direct_acfs_home:-$TARGET_HOME/.acfs}" \
+                ACFS_BIN_DIR="${ACFS_BIN_DIR:-}" \
+                "$acfs_bin" "$@"
+        fi
+        exec "$acfs_bin" "$@"
+    fi
+
+    # IMPORTANT: Avoid `sudo -i` which sources shell profile files.
+    # Third-party installers sometimes modify those files in ways that can
+    # break non-interactive runs. We set HOME with `-H` but preserve CWD.
+    exec_as_target_user "$target_user" "$acfs_bin" "$@"
+}
+
+main "$@"
