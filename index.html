@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agent 开发学习总入口</title>
+  <meta name="color-scheme" content="dark light" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --line: rgba(132, 185, 255, 0.18);
+      --line-strong: rgba(255, 193, 99, 0.35);
+      --text: #edf3ff;
+      --muted: #96abc9;
+      --accent: #ffc163;
+      --accent-2: #74d5ff;
+      --accent-3: #86efc3;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
+      --radius-xl: 30px;
+      --radius-lg: 22px;
+      --radius-md: 16px;
+      --max-width: 1280px;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; font-family: 'Manrope', 'Segoe UI', sans-serif; color: var(--text); background: radial-gradient(circle at top left, rgba(116, 213, 255, 0.15), transparent 28%), radial-gradient(circle at 85% 10%, rgba(255, 193, 99, 0.14), transparent 24%), linear-gradient(135deg, #050b12 0%, #0a1524 42%, #09111d 100%); overflow-x: hidden; }
+    body::before { content: ""; position: fixed; inset: 0; pointer-events: none; background: linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px); background-size: 30px 30px; mask-image: radial-gradient(circle at center, black 45%, transparent 100%); opacity: 0.28; }
+    a { color: inherit; text-decoration: none; }
+    .page { width: min(var(--max-width), calc(100% - 32px)); margin: 0 auto; padding: 28px 0 44px; position: relative; z-index: 1; }
+    .hero { position: sticky; top: 16px; z-index: 10; padding: 26px 28px; border: 1px solid var(--line-strong); border-radius: var(--radius-xl); background: linear-gradient(180deg, rgba(12, 22, 40, 0.96), rgba(8, 16, 29, 0.92)); backdrop-filter: blur(18px); box-shadow: var(--shadow); margin-bottom: 24px; }
+    .hero-top { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; margin-bottom: 18px; }
+    .eyebrow { display: inline-flex; align-items: center; gap: 8px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.24em; font-size: 12px; margin-bottom: 12px; }
+    .eyebrow::before { content: ""; width: 28px; height: 1px; background: currentColor; }
+    .hero h1 { margin: 0; font-family: 'Noto Serif SC', serif; font-size: clamp(34px, 5vw, 58px); line-height: 1.08; }
+    .hero p { margin: 12px 0 0; color: var(--muted); font-size: 16px; line-height: 1.8; max-width: 780px; }
+    .hero-stats { min-width: 240px; padding: 16px 18px; border-radius: 20px; border: 1px solid var(--line); background: linear-gradient(180deg, rgba(255, 193, 99, 0.10), rgba(116, 213, 255, 0.05)); }
+    .hero-stats .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.18em; color: var(--accent); margin-bottom: 10px; }
+    .hero-stats strong { display: block; font-size: 28px; margin-bottom: 6px; }
+    .hero-stats span { color: var(--muted); line-height: 1.6; font-size: 14px; }
+    .quick-nav { display: flex; flex-wrap: wrap; gap: 12px; }
+    .quick-link { padding: 12px 16px; border-radius: 999px; border: 1px solid var(--line); background: rgba(13, 25, 43, 0.78); transition: transform 160ms ease, border-color 160ms ease, background 160ms ease; font-size: 14px; }
+    .quick-link:hover { transform: translateY(-1px); border-color: var(--accent-2); background: rgba(20, 36, 60, 0.95); }
+    .section-title { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 26px 2px 16px; }
+    .section-title h2 { margin: 0; font-family: 'Noto Serif SC', serif; font-size: clamp(24px, 3vw, 34px); }
+    .section-title p { margin: 0; color: var(--muted); font-size: 14px; }
+    .sequence { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 18px; }
+    .sequence-pill { padding: 10px 14px; border-radius: 999px; border: 1px solid var(--line); background: rgba(10, 20, 36, 0.72); color: var(--muted); font-size: 13px; }
+    .sequence-pill strong { color: var(--text); }
+    .sequence-pill.active { border-color: var(--line-strong); color: var(--text); background: linear-gradient(135deg, rgba(255,193,99,0.15), rgba(116,213,255,0.12)); }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+    .card { position: relative; display: flex; flex-direction: column; min-height: 250px; padding: 22px; border-radius: var(--radius-lg); border: 1px solid var(--line); background: linear-gradient(180deg, rgba(10, 20, 36, 0.92), rgba(8, 16, 29, 0.86)); box-shadow: var(--shadow); transition: transform 180ms ease, border-color 180ms ease, background 180ms ease; overflow: hidden; }
+    .card::after { content: ""; position: absolute; inset: auto -40px -40px auto; width: 160px; height: 160px; border-radius: 50%; background: radial-gradient(circle, rgba(116, 213, 255, 0.15), transparent 70%); pointer-events: none; }
+    .card:hover { transform: translateY(-4px); border-color: rgba(255, 193, 99, 0.42); background: linear-gradient(180deg, rgba(14, 26, 46, 0.96), rgba(8, 16, 29, 0.92)); }
+    .card.current { border-color: rgba(255, 193, 99, 0.48); box-shadow: 0 24px 80px rgba(0, 0, 0, 0.32), inset 0 0 0 1px rgba(255,193,99,0.14); }
+    .card-index { display: inline-flex; align-self: flex-start; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line-strong); color: var(--accent); font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 14px; background: rgba(255, 193, 99, 0.08); }
+    .card h3 { margin: 0 0 10px; font-family: 'Noto Serif SC', serif; font-size: 24px; line-height: 1.25; }
+    .card p { margin: 0; color: var(--muted); line-height: 1.8; font-size: 14px; }
+    .card-meta { margin-top: auto; padding-top: 18px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .card-tag { color: var(--accent-3); font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; }
+    .card-action { padding: 10px 14px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,0.02); font-size: 13px; }
+    .footer { margin-top: 22px; padding: 18px 20px; border: 1px solid var(--line); border-radius: var(--radius-md); background: rgba(10, 20, 36, 0.72); color: var(--muted); line-height: 1.8; font-size: 14px; }
+    @media (max-width: 1080px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .hero-top { flex-direction: column; } .hero-stats { min-width: 0; width: 100%; } }
+    @media (max-width: 720px) { .page { width: min(var(--max-width), calc(100% - 20px)); padding-top: 16px; } .hero { position: relative; top: auto; padding: 20px 16px; } .grid { grid-template-columns: 1fr; } .card { min-height: 220px; } .hero h1 { font-size: 34px; } }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div class="hero-top">
+        <div>
+          <div class="eyebrow">Learning Portal</div>
+          <h1>Agent 开发学习总入口</h1>
+          <p>围绕 Agent 工程核心能力构建的一站式学习门户。你可以从基础认知开始，逐步进入 Prompt、工具、记忆、RAG、多 Agent、评测、安全与工程实战，并通过各模块的单页导航页查看阶段成果。</p>
+        </div>
+        <aside class="hero-stats">
+          <div class="label">当前学习地图</div>
+          <strong>9 个模块</strong>
+          <span>覆盖从基础到工程化实战的完整学习路径，每个模块都已具备独立网页入口。</span>
+        </aside>
+      </div>
+      <nav class="quick-nav">
+        <a class="quick-link" href="./01-Agent-Foundation/index.html">基础认知</a>
+        <a class="quick-link" href="./RAG/index.html">RAG</a>
+        <a class="quick-link" href="./05-Multi-Agent-Systems/index.html">多 Agent</a>
+        <a class="quick-link" href="./08-Agent-Engineering-Projects/index.html">工程实战</a>
+      </nav>
+    </header>
+    <section class="section-title"><div><h2>推荐学习顺序</h2><p>按照主线推进，从概念到工程落地逐步加深。</p></div></section>
+    <div class="sequence"><a class="sequence-pill active" href="./01-Agent-Foundation/index.html"><strong>01</strong> Agent Foundation</a>
+      <a class="sequence-pill active" href="./02-LLM-and-Prompting/index.html"><strong>02</strong> LLM and Prompting</a>
+      <a class="sequence-pill active" href="./03-Tool-Use-and-Workflow/index.html"><strong>03</strong> Tool Use and Workflow</a>
+      <a class="sequence-pill active" href="./04-Memory-and-Planning/index.html"><strong>04</strong> Memory and Planning</a>
+      <a class="sequence-pill active" href="./RAG/index.html"><strong>05</strong> RAG</a>
+      <a class="sequence-pill active" href="./05-Multi-Agent-Systems/index.html"><strong>06</strong> Multi-Agent Systems</a>
+      <a class="sequence-pill active" href="./06-Evaluation-and-Observability/index.html"><strong>07</strong> Evaluation and Observability</a>
+      <a class="sequence-pill active" href="./07-Agent-Safety-and-Guardrails/index.html"><strong>08</strong> Safety and Guardrails</a>
+      <a class="sequence-pill active" href="./08-Agent-Engineering-Projects/index.html"><strong>09</strong> Engineering Projects</a></div>
+    <section class="section-title"><div><h2>学习模块导航</h2><p>建议按推荐顺序学习，也可按当前关注主题直接进入。</p></div></section>
+    <main class="grid"><a class="card current" href="./01-Agent-Foundation/index.html">
+        <div class="card-index">01</div>
+        <h3>Agent Foundation</h3>
+        <p>建立 Agent 的定义、边界、运行时结构与核心心智模型，是后续所有模块的基础入口。</p>
+        <div class="card-meta">
+          <span class="card-tag">基础认知</span>
+          <span class="card-action">进入模块</span>
+        </div>
+      </a>
+      <a class="card current" href="./02-LLM-and-Prompting/index.html">
+        <div class="card-index">02</div>
+        <h3>LLM and Prompting</h3>
+        <p>理解模型能力边界、提示词设计、上下文组织与结构化输出，打好 Agent 决策层基础。</p>
+        <div class="card-meta">
+          <span class="card-tag">模型能力</span>
+          <span class="card-action">进入模块</span>
+        </div>
+      </a>
+      <a class="card current" href="./03-Tool-Use-and-Workflow/index.html">
+        <div class="card-index">03</div>
+        <h3>Tool Use and Workflow</h3>
+        <p>聚焦工具调用、环境交互、流程编排与状态流转，帮助你理解 Agent 如何真正执行任务。</p>
+        <div class="card-meta">
+          <span class="card-tag">执行工作流</span>
+          <span class="card-action">进入模块</span>
+        </div>
+      </a>
+      <a class="card current" href="./04-Memory-and-Planning/index.html">
+        <div class="card-index">04</div>
+        <h3>Memory and Planning</h3>
+        <p>学习短期记忆、长期记忆、任务分解与规划执行，让 Agent 从会答走向会做。</p>
+        <div class="card-meta">
+          <span class="card-tag">记忆规划</span>
+          <span class="card-action">进入模块</span>
+        </div>
+      </a>
+      <a class="card current" href="./RAG/index.html">
+        <div class="card-index">05</div>
+        <h3>RAG</h3>
+        <p>掌握检索增强生成，从知识库构建、召回、重排到生成增强，理解 Agent + RAG 组合方式。</p>
+        <div class="card-meta">
+          <span class="card-tag">检索增强</span>
+          <span class="card-action">进入模块</span>
+        </div>
+      </a>
+      <a class="card current" href="./05-Multi-Agent-Systems/index.html">
+        <div class="card-index">06</div>
+        <h3>Multi-Agent Systems</h3>
+        <p>进入角色分工、监督路由、协作拓扑与并发模式，理解复杂 Agent 系统如何稳定协同。</p>
+        <div class="card-meta">
+          <span class="card-tag">多体协作</span>
+          <span class="card-action">进入模块</span>
+        </div>
+      </a>
+      <a class="card current" href="./06-Evaluation-and-Observability/index.html">
+        <div class="card-index">07</div>
+        <h3>Evaluation and Observability</h3>
+        <p>建立评测、追踪、日志与可观察性意识，让 Agent 应用可衡量、可定位、可优化。</p>
+        <div class="card-meta">
+          <span class="card-tag">评测运维</span>
+          <span class="card-action">进入模块</span>
+        </div>
+      </a>
+      <a class="card current" href="./07-Agent-Safety-and-Guardrails/index.html">
+        <div class="card-index">08</div>
+        <h3>Safety and Guardrails</h3>
+        <p>关注权限边界、注入防护、安全治理与审计能力，帮助你构建可上线、可控的 Agent 系统。</p>
+        <div class="card-meta">
+          <span class="card-tag">安全治理</span>
+          <span class="card-action">进入模块</span>
+        </div>
+      </a>
+      <a class="card current" href="./08-Agent-Engineering-Projects/index.html">
+        <div class="card-index">09</div>
+        <h3>Engineering Projects</h3>
+        <p>通过端到端项目实战把前面所有能力串起来，从 demo 走向可扩展的工程实现。</p>
+        <div class="card-meta">
+          <span class="card-tag">项目实战</span>
+          <span class="card-action">进入模块</span>
+        </div>
+      </a></main>
+    <footer class="footer">建议学习顺序：基础认知 → 模型与 Prompt → 工具与工作流 → 记忆与规划 → RAG → 多 Agent → 评测与可观测性 → 安全与护栏 → 工程项目实战。当前页面是总入口，具体内容请进入各模块单页查看。</footer>
+  </div>
+</body>
+</html>

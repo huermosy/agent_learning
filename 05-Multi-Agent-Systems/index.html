@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>05-Multi-Agent-Systems · Learning Atlas</title>
+  <meta name="color-scheme" content="dark light" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/lib/marked.umd.js"></script>
+  <style>
+    :root {
+      --line: rgba(151, 196, 255, 0.2); --line-strong: rgba(255, 199, 122, 0.35); --text: #edf3ff; --muted: #98aac6; --accent: #ffc163; --accent-2: #77d5ff; --accent-3: #8ee7c7; --shadow: 0 24px 80px rgba(0, 0, 0, 0.35); --content-width: 980px;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; font-family: 'Manrope', 'Segoe UI', sans-serif; color: var(--text); background: radial-gradient(circle at top left, rgba(119, 213, 255, 0.16), transparent 30%), radial-gradient(circle at top right, rgba(255, 193, 99, 0.14), transparent 28%), linear-gradient(135deg, #040b14 0%, #091423 42%, #08101b 100%); overflow-x: hidden; }
+    body::before { content: ""; position: fixed; inset: 0; pointer-events: none; background: linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px); background-size: 28px 28px; mask-image: radial-gradient(circle at center, black 45%, transparent 100%); opacity: 0.32; }
+    a { color: var(--accent-2); }
+    .shell { display: grid; grid-template-columns: 320px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar { position: sticky; top: 0; height: 100vh; padding: 28px 22px; border-right: 1px solid var(--line); background: linear-gradient(180deg, rgba(5, 12, 22, 0.94), rgba(5, 12, 22, 0.82)); backdrop-filter: blur(16px); display: flex; flex-direction: column; gap: 18px; }
+    .brand { padding: 18px 18px 20px; border: 1px solid var(--line-strong); border-radius: 20px; background: linear-gradient(180deg, rgba(255, 193, 99, 0.09), rgba(119, 213, 255, 0.05)); box-shadow: var(--shadow); }
+    .eyebrow { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; letter-spacing: 0.24em; text-transform: uppercase; color: var(--accent); margin-bottom: 10px; }
+    .eyebrow::before { content: ""; width: 28px; height: 1px; background: currentColor; }
+    .brand h1 { margin: 0; font-family: 'Noto Serif SC', serif; font-size: 28px; line-height: 1.18; }
+    .brand p { margin: 12px 0 0; color: var(--muted); line-height: 1.65; font-size: 14px; }
+    .toolbar { display: grid; gap: 10px; }
+    .toolbar a, .toolbar button { appearance: none; border: 1px solid var(--line); background: rgba(11, 24, 44, 0.72); color: var(--text); border-radius: 999px; padding: 12px 16px; font: inherit; text-decoration: none; cursor: pointer; transition: transform 160ms ease, border-color 160ms ease, background 160ms ease; text-align: center; }
+    .toolbar a:hover, .toolbar button:hover { transform: translateY(-1px); border-color: var(--accent-2); background: rgba(17, 34, 62, 0.92); }
+    .sequence { display: flex; flex-direction: column; gap: 8px; padding: 12px 0 2px; }
+    .sequence-item { display: flex; gap: 10px; align-items: center; padding: 10px 12px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.03); color: var(--muted); background: rgba(8, 18, 32, 0.44); text-decoration: none; }
+    .sequence-item strong { color: var(--text); font-size: 13px; }
+    .sequence-item span { font-size: 12px; }
+    .sequence-item.active { border-color: var(--line-strong); background: linear-gradient(135deg, rgba(255,193,99,0.15), rgba(119,213,255,0.12)); }
+    .sequence-badge { display: inline-flex; min-width: 32px; justify-content: center; padding: 5px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--accent); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; }
+    .tabs { display: flex; flex-direction: column; gap: 10px; overflow: auto; padding-right: 4px; }
+    .tab { width: 100%; border: 1px solid transparent; border-radius: 18px; padding: 16px 18px; background: rgba(10, 22, 39, 0.5); color: var(--text); text-align: left; cursor: pointer; transition: transform 180ms ease, border-color 180ms ease, background 180ms ease; }
+    .tab:hover { transform: translateX(3px); border-color: var(--line); background: rgba(16, 30, 50, 0.88); }
+    .tab.active { border-color: rgba(255, 193, 99, 0.55); background: linear-gradient(135deg, rgba(255, 193, 99, 0.15), rgba(119, 213, 255, 0.12)); box-shadow: 0 14px 30px rgba(0,0,0,0.22); }
+    .tab strong { display: block; font-size: 15px; margin-bottom: 6px; }
+    .tab span { display: block; font-size: 12px; line-height: 1.55; color: var(--muted); }
+    .main { padding: 30px 32px 56px; min-width: 0; }
+    .hero { position: sticky; top: 0; z-index: 10; margin-bottom: 24px; padding: 18px 22px; border: 1px solid var(--line); border-radius: 22px; background: rgba(7, 16, 29, 0.84); backdrop-filter: blur(18px); display: flex; align-items: center; justify-content: space-between; gap: 18px; box-shadow: var(--shadow); }
+    .hero-copy .label { font-size: 12px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--accent-2); margin-bottom: 8px; }
+    .hero-copy h2 { margin: 0; font-family: 'Noto Serif SC', serif; font-size: clamp(28px, 4vw, 42px); line-height: 1.08; }
+    .hero-copy p { margin: 10px 0 0; color: var(--muted); max-width: 720px; line-height: 1.75; }
+    .meta-card { flex: 0 0 240px; padding: 16px 18px; border-radius: 18px; border: 1px solid var(--line-strong); background: linear-gradient(180deg, rgba(255, 193, 99, 0.11), rgba(255, 193, 99, 0.02)); }
+    .meta-card .meta-k { font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
+    .meta-card .meta-v { font-size: 14px; line-height: 1.6; word-break: break-all; }
+    .content-frame { max-width: var(--content-width); padding: 34px clamp(20px, 3vw, 42px); border-radius: 28px; border: 1px solid var(--line); background: linear-gradient(180deg, rgba(7, 16, 29, 0.92), rgba(7, 16, 29, 0.82)); box-shadow: var(--shadow); overflow: hidden; }
+    .article { min-height: 55vh; line-height: 1.85; font-size: 17px; overflow-wrap: anywhere; }
+    .article > :first-child { margin-top: 0; }
+    .article h1, .article h2, .article h3, .article h4 { font-family: 'Noto Serif SC', serif; line-height: 1.25; margin-top: 1.7em; margin-bottom: 0.6em; }
+    .article h1 { font-size: clamp(34px, 4vw, 48px); } .article h2 { font-size: clamp(26px, 3vw, 34px); } .article h3 { font-size: clamp(22px, 2vw, 28px); }
+    .article p, .article li { color: #e3ebfa; } .article strong { color: #ffffff; }
+    .article blockquote { margin: 1.4em 0; padding: 14px 18px; border-left: 3px solid var(--accent); background: rgba(255, 193, 99, 0.08); color: #ffe8c7; border-radius: 0 14px 14px 0; }
+    .article code { padding: 0.16em 0.42em; border-radius: 8px; background: rgba(119, 213, 255, 0.12); color: #bcecff; font-family: Consolas, monospace; }
+    .article pre { padding: 18px; overflow: auto; border-radius: 18px; border: 1px solid rgba(119, 213, 255, 0.16); background: #050d18; }
+    .article pre code { padding: 0; background: transparent; color: #d8ebff; }
+    .article table { width: 100%; border-collapse: collapse; margin: 1.5em 0; border-radius: 16px; border: 1px solid var(--line); overflow: hidden; }
+    .article th, .article td { padding: 12px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .article th { background: rgba(119, 213, 255, 0.1); color: white; }
+    .article img { max-width: 100%; border-radius: 18px; display: block; margin: 1.5em auto; box-shadow: var(--shadow); }
+    .module-nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 18px; }
+    .module-link { display: flex; flex-direction: column; gap: 6px; padding: 14px 16px; border-radius: 18px; border: 1px solid var(--line); background: rgba(10, 22, 39, 0.56); color: var(--text); text-decoration: none; }
+    .module-link:hover { border-color: var(--accent-2); background: rgba(16, 30, 50, 0.88); }
+    .module-link.center { align-items: center; justify-content: center; text-align: center; }
+    .module-link small { color: var(--muted); font-size: 12px; }
+    .module-link strong { font-size: 15px; }
+    .footer-note { margin-top: 18px; color: var(--muted); font-size: 13px; }
+    @media (max-width: 1080px) { .shell { grid-template-columns: 1fr; } .sidebar { position: relative; height: auto; border-right: 0; border-bottom: 1px solid var(--line); } .tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); } .hero { position: relative; flex-direction: column; align-items: flex-start; } .meta-card { width: 100%; flex-basis: auto; } .module-nav { grid-template-columns: 1fr; } }
+    @media (max-width: 720px) { .main { padding: 18px 14px 32px; } .sidebar { padding: 18px 14px; } .tabs { grid-template-columns: 1fr; } .content-frame { padding: 22px 16px; border-radius: 22px; } .hero { padding: 16px; border-radius: 18px; } .brand h1 { font-size: 24px; } .article { font-size: 16px; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <section class="brand">
+        <div class="eyebrow">Learning Atlas</div>
+        <h1 id="moduleTitle">05-Multi-Agent-Systems</h1>
+        <p>进入角色分工、监督路由、协作拓扑与并发模式，理解复杂 Agent 系统如何稳定协同。</p>
+      </section>
+      <nav class="toolbar">
+        <a href="../index.html">返回总目录</a>
+        <button type="button" id="reloadButton">重新渲染当前内容</button>
+      </nav>
+      <section class="sequence"><a class="sequence-item" href="../01-Agent-Foundation/index.html"><span class="sequence-badge">01</span><span><strong>Agent Foundation</strong><br>基础认知</span></a>
+        <a class="sequence-item" href="../02-LLM-and-Prompting/index.html"><span class="sequence-badge">02</span><span><strong>LLM and Prompting</strong><br>模型能力</span></a>
+        <a class="sequence-item" href="../03-Tool-Use-and-Workflow/index.html"><span class="sequence-badge">03</span><span><strong>Tool Use and Workflow</strong><br>执行工作流</span></a>
+        <a class="sequence-item" href="../04-Memory-and-Planning/index.html"><span class="sequence-badge">04</span><span><strong>Memory and Planning</strong><br>记忆规划</span></a>
+        <a class="sequence-item" href="../RAG/index.html"><span class="sequence-badge">05</span><span><strong>RAG</strong><br>检索增强</span></a>
+        <a class="sequence-item active" href="../05-Multi-Agent-Systems/index.html"><span class="sequence-badge">06</span><span><strong>Multi-Agent Systems</strong><br>多体协作</span></a>
+        <a class="sequence-item" href="../06-Evaluation-and-Observability/index.html"><span class="sequence-badge">07</span><span><strong>Evaluation and Observability</strong><br>评测运维</span></a>
+        <a class="sequence-item" href="../07-Agent-Safety-and-Guardrails/index.html"><span class="sequence-badge">08</span><span><strong>Safety and Guardrails</strong><br>安全治理</span></a>
+        <a class="sequence-item" href="../08-Agent-Engineering-Projects/index.html"><span class="sequence-badge">09</span><span><strong>Engineering Projects</strong><br>项目实战</span></a></section>
+      <section class="tabs" id="tabs"></section>
+    </aside>
+    <main class="main">
+      <section class="hero">
+        <div class="hero-copy">
+          <div class="label">Module Navigator</div>
+          <h2 id="activeTitle">模块概览</h2>
+          <p id="activeDescription">通过突出导航栏和单页 TAB 切换快速浏览当前学习模块的完整知识结构。</p>
+        </div>
+        <div class="meta-card">
+          <div class="meta-k">当前文件</div>
+          <div class="meta-v" id="sourcePath">README.md</div>
+        </div>
+      </section>
+      <section class="content-frame">
+        <article class="article" id="content">正在加载内容…</article>
+        <nav class="module-nav"><a class="module-link" href="../RAG/index.html"><small>上一个模块</small><strong>05 · RAG</strong></a><a class="module-link center" href="../index.html"><small>总入口</small><strong>返回学习总目录</strong></a><a class="module-link" href="../06-Evaluation-and-Observability/index.html"><small>下一个模块</small><strong>07 · Evaluation and Observability</strong></a></nav>
+        <div class="footer-note">提示：此页面已经内嵌 Markdown 内容，直接双击打开 index.html 也可正常切换，不依赖本地静态服务。</div>
+      </section>
+    </main>
+  </div>
+  <script id="tabs-data" type="application/json">[{"id": "overview", "label": "模块概览", "path": "README.md", "description": "先看模块目标、适合人群与整体导航。"}, {"id": "roadmap", "label": "学习路线", "path": "md/learning-roadmap.md", "description": "按阶段拆解学习顺序与关键目标。"}, {"id": "glossary", "label": "术语表", "path": "md/glossary.md", "description": "统一关键术语与易混概念。"}, {"id": "projects", "label": "实践项目", "path": "md/practice-projects.md", "description": "通过项目练习把知识变成产出。"}, {"id": "interview", "label": "面试题", "path": "md/interview-questions.md", "description": "检验理解深度，训练结构化表达。"}, {"id": "checklist", "label": "学习清单", "path": "md/checklist.md", "description": "用完成标准快速核对掌握程度。"}]</script>
+  <script id="markdown-data" type="application/json">{"overview": "# 多 Agent 系统\n\n## 模块简介\n本模块研究多个 Agent 如何分工协作，包括角色设计、任务路由、监督者模式与并行执行策略。\n\n## 你将学到\n- 多 Agent 架构模式\n- Supervisor / Router / Specialist 设计\n- 通信协议与共享上下文\n- 并发、冲突与协作控制\n\n## 学习导航\n- 学习路线：[`md/learning-roadmap.md`](./md/learning-roadmap.md)\n- 术语表：[`md/glossary.md`](./md/glossary.md)\n- 实践项目：[`md/practice-projects.md`](./md/practice-projects.md)\n- 面试题：[`md/interview-questions.md`](./md/interview-questions.md)\n- 学习清单：[`md/checklist.md`](./md/checklist.md)\n- 返回总目录：[`../README.md`](../README.md)\n", "roadmap": "# 多 Agent 系统学习路线\n\n## 1. 学习目标\n掌握多个 Agent 之间如何分工、协作、竞争与监督，构建复杂任务系统。\n\n## 2. 核心知识点\n- Router / Supervisor / Specialist 模式\n- 共享状态与消息传递\n- 任务分配与结果汇总\n- 并行执行与冲突控制\n- 成本、时延与收益权衡\n\n## 3. 学习顺序\n### 阶段一：模式理解\n- 单 Agent 的瓶颈\n- 为什么需要多 Agent\n- 常见多 Agent 组织方式\n\n### 阶段二：协作设计\n- 子任务切分\n- Agent 间通信协议\n- 仲裁与审批节点\n\n### 阶段三：系统优化\n- 减少重复劳动\n- 控制上下文膨胀\n- 降低协作噪音\n\n## 4. 建议产出\n- 设计一个 3 角色多 Agent 系统\n- 给每个角色写清楚职责边界\n- 做一次单 Agent 与多 Agent 的效果对比\n\n## 5. 进阶衔接\n完成后进入：`../06-Evaluation-and-Observability/README.md`\n", "glossary": "# 多 Agent 系统术语表\n\n## 核心术语\n- **Supervisor**：负责任务调度与监督的上层 Agent。\n- **Router**：负责把任务路由给合适子 Agent 的组件。\n- **Specialist**：面向特定能力域的专门 Agent。\n- **Shared Context**：多个 Agent 共享的上下文或状态。\n- **Arbitration**：多个候选结果之间的仲裁机制。\n\n## 常见易混淆概念\n- **Router vs Supervisor**：前者偏分发，后者偏统筹与监督。\n- **多 Agent vs 多工具**：前者是多角色协作，后者是单 Agent 调多工具。\n", "projects": "# 多 Agent 系统实践项目\n\n## 入门项目：双 Agent 协作\n- 目标：设计一个 Router + Specialist 示例。\n- 交付物：能分派任务并汇总结果的原型。\n- 验收标准：不同任务能被路由到不同角色。\n\n## 进阶项目：监督者系统\n- 目标：构建 Supervisor 监督多个子 Agent 的执行。\n- 交付物：带任务分发与审核节点的系统。\n- 验收标准：支持分工、汇总和基础仲裁。\n", "interview": "# 多 Agent 系统面试题\n\n## 基础题\n1. 为什么单 Agent 在复杂任务中会遇到瓶颈？\n2. 多 Agent 系统中常见角色有哪些？\n3. Router 和 Supervisor 的区别是什么？\n\n## 场景题\n1. 如果多个 Agent 给出冲突结果，你会如何处理？\n2. 如果多 Agent 系统成本过高，你会如何优化？\n", "checklist": "# 多 Agent 系统学习清单\n\n- [ ] 能解释多 Agent 的价值\n- [ ] 能区分常见角色模式\n- [ ] 能设计基础协作流程\n- [ ] 能分析协作冲突与成本问题\n"}</script>
+  <script>
+    const tabs = JSON.parse(document.getElementById('tabs-data').textContent);
+    const markdownMap = JSON.parse(document.getElementById('markdown-data').textContent);
+    const tabsRoot = document.getElementById('tabs');
+    const content = document.getElementById('content');
+    const activeTitle = document.getElementById('activeTitle');
+    const activeDescription = document.getElementById('activeDescription');
+    const sourcePath = document.getElementById('sourcePath');
+    const reloadButton = document.getElementById('reloadButton');
+    const hasMarked = typeof window.marked !== 'undefined' && typeof window.marked.parse === 'function';
+    if (hasMarked) {
+      marked.setOptions({ breaks: true, gfm: true });
+    }
+
+    function escapeHtml(text) {
+      return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+
+    function fallbackMarkdownToHtml(markdown) {
+      const escaped = escapeHtml(markdown);
+      return '<pre style="white-space:pre-wrap;line-height:1.8;">' + escaped + '</pre>';
+    }
+
+    function renderMarkdown(markdown) {
+      if (hasMarked) {
+        try {
+          return marked.parse(markdown);
+        } catch (e) {
+          return fallbackMarkdownToHtml(markdown);
+        }
+      }
+      return fallbackMarkdownToHtml(markdown);
+    }
+
+    function renderTabs(activeId) {
+      tabsRoot.innerHTML = '';
+      tabs.forEach((item) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'tab' + (item.id === activeId ? ' active' : '');
+        button.innerHTML = '<strong>' + item.label + '</strong><span>' + item.description + '</span>';
+        button.addEventListener('click', () => loadTab(item.id));
+        tabsRoot.appendChild(button);
+      });
+    }
+
+    function loadTab(id) {
+      const current = tabs.find((item) => item.id === id) || tabs[0];
+      renderTabs(current.id);
+      activeTitle.textContent = current.label;
+      activeDescription.textContent = current.description;
+      sourcePath.textContent = current.path;
+      const markdown = markdownMap[current.id] || '# 内容缺失\n\n未找到对应内容。';
+      content.innerHTML = renderMarkdown(markdown);
+      if (location.hash !== '#' + current.id) {
+        history.replaceState(null, '', '#' + current.id);
+      }
+    }
+
+    reloadButton.addEventListener('click', () => {
+      const id = location.hash.replace('#', '') || tabs[0].id;
+      loadTab(id);
+    });
+
+    window.addEventListener('hashchange', () => {
+      const id = location.hash.replace('#', '');
+      if (tabs.some((item) => item.id === id)) {
+        loadTab(id);
+      }
+    });
+
+    loadTab(location.hash.replace('#', '') || tabs[0].id);
+  </script>
+</body>
+</html>

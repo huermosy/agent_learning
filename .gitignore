@@ -1,3 +1,23 @@
 .claude/
 .omc/sessions/
 .omc/state/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+
+# Generated helper docs
+**/AGENTS.md
+RAG/github-practice-picker-RAG-3.md
+
+# Imported external repos / bulky learning mirrors (not part of this repo's core source)
+07-Agent-Safety-and-Guardrails/agentic_coding_flywheel_setup/
+07-Agent-Safety-and-Guardrails/goclaw/
+07-Agent-Safety-and-Guardrails/poco-claw/
+08-Agent-Engineering-Projects/agency-agents/
+08-Agent-Engineering-Projects/gemini-cli/
+08-Agent-Engineering-Projects/hermes-agent/
+RAG/claude-mem/
+RAG/hello-agents/
+RAG/ruflo/

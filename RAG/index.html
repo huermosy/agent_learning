@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RAG · Learning Atlas</title>
+  <meta name="color-scheme" content="dark light" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/lib/marked.umd.js"></script>
+  <style>
+    :root {
+      --line: rgba(151, 196, 255, 0.2); --line-strong: rgba(255, 199, 122, 0.35); --text: #edf3ff; --muted: #98aac6; --accent: #ffc163; --accent-2: #77d5ff; --accent-3: #8ee7c7; --shadow: 0 24px 80px rgba(0, 0, 0, 0.35); --content-width: 980px;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; font-family: 'Manrope', 'Segoe UI', sans-serif; color: var(--text); background: radial-gradient(circle at top left, rgba(119, 213, 255, 0.16), transparent 30%), radial-gradient(circle at top right, rgba(255, 193, 99, 0.14), transparent 28%), linear-gradient(135deg, #040b14 0%, #091423 42%, #08101b 100%); overflow-x: hidden; }
+    body::before { content: ""; position: fixed; inset: 0; pointer-events: none; background: linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px); background-size: 28px 28px; mask-image: radial-gradient(circle at center, black 45%, transparent 100%); opacity: 0.32; }
+    a { color: var(--accent-2); }
+    .shell { display: grid; grid-template-columns: 320px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar { position: sticky; top: 0; height: 100vh; padding: 28px 22px; border-right: 1px solid var(--line); background: linear-gradient(180deg, rgba(5, 12, 22, 0.94), rgba(5, 12, 22, 0.82)); backdrop-filter: blur(16px); display: flex; flex-direction: column; gap: 18px; }
+    .brand { padding: 18px 18px 20px; border: 1px solid var(--line-strong); border-radius: 20px; background: linear-gradient(180deg, rgba(255, 193, 99, 0.09), rgba(119, 213, 255, 0.05)); box-shadow: var(--shadow); }
+    .eyebrow { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; letter-spacing: 0.24em; text-transform: uppercase; color: var(--accent); margin-bottom: 10px; }
+    .eyebrow::before { content: ""; width: 28px; height: 1px; background: currentColor; }
+    .brand h1 { margin: 0; font-family: 'Noto Serif SC', serif; font-size: 28px; line-height: 1.18; }
+    .brand p { margin: 12px 0 0; color: var(--muted); line-height: 1.65; font-size: 14px; }
+    .toolbar { display: grid; gap: 10px; }
+    .toolbar a, .toolbar button { appearance: none; border: 1px solid var(--line); background: rgba(11, 24, 44, 0.72); color: var(--text); border-radius: 999px; padding: 12px 16px; font: inherit; text-decoration: none; cursor: pointer; transition: transform 160ms ease, border-color 160ms ease, background 160ms ease; text-align: center; }
+    .toolbar a:hover, .toolbar button:hover { transform: translateY(-1px); border-color: var(--accent-2); background: rgba(17, 34, 62, 0.92); }
+    .sequence { display: flex; flex-direction: column; gap: 8px; padding: 12px 0 2px; }
+    .sequence-item { display: flex; gap: 10px; align-items: center; padding: 10px 12px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.03); color: var(--muted); background: rgba(8, 18, 32, 0.44); text-decoration: none; }
+    .sequence-item strong { color: var(--text); font-size: 13px; }
+    .sequence-item span { font-size: 12px; }
+    .sequence-item.active { border-color: var(--line-strong); background: linear-gradient(135deg, rgba(255,193,99,0.15), rgba(119,213,255,0.12)); }
+    .sequence-badge { display: inline-flex; min-width: 32px; justify-content: center; padding: 5px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--accent); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; }
+    .tabs { display: flex; flex-direction: column; gap: 10px; overflow: auto; padding-right: 4px; }
+    .tab { width: 100%; border: 1px solid transparent; border-radius: 18px; padding: 16px 18px; background: rgba(10, 22, 39, 0.5); color: var(--text); text-align: left; cursor: pointer; transition: transform 180ms ease, border-color 180ms ease, background 180ms ease; }
+    .tab:hover { transform: translateX(3px); border-color: var(--line); background: rgba(16, 30, 50, 0.88); }
+    .tab.active { border-color: rgba(255, 193, 99, 0.55); background: linear-gradient(135deg, rgba(255, 193, 99, 0.15), rgba(119, 213, 255, 0.12)); box-shadow: 0 14px 30px rgba(0,0,0,0.22); }
+    .tab strong { display: block; font-size: 15px; margin-bottom: 6px; }
+    .tab span { display: block; font-size: 12px; line-height: 1.55; color: var(--muted); }
+    .main { padding: 30px 32px 56px; min-width: 0; }
+    .hero { position: sticky; top: 0; z-index: 10; margin-bottom: 24px; padding: 18px 22px; border: 1px solid var(--line); border-radius: 22px; background: rgba(7, 16, 29, 0.84); backdrop-filter: blur(18px); display: flex; align-items: center; justify-content: space-between; gap: 18px; box-shadow: var(--shadow); }
+    .hero-copy .label { font-size: 12px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--accent-2); margin-bottom: 8px; }
+    .hero-copy h2 { margin: 0; font-family: 'Noto Serif SC', serif; font-size: clamp(28px, 4vw, 42px); line-height: 1.08; }
+    .hero-copy p { margin: 10px 0 0; color: var(--muted); max-width: 720px; line-height: 1.75; }
+    .meta-card { flex: 0 0 240px; padding: 16px 18px; border-radius: 18px; border: 1px solid var(--line-strong); background: linear-gradient(180deg, rgba(255, 193, 99, 0.11), rgba(255, 193, 99, 0.02)); }
+    .meta-card .meta-k { font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
+    .meta-card .meta-v { font-size: 14px; line-height: 1.6; word-break: break-all; }
+    .content-frame { max-width: var(--content-width); padding: 34px clamp(20px, 3vw, 42px); border-radius: 28px; border: 1px solid var(--line); background: linear-gradient(180deg, rgba(7, 16, 29, 0.92), rgba(7, 16, 29, 0.82)); box-shadow: var(--shadow); overflow: hidden; }
+    .article { min-height: 55vh; line-height: 1.85; font-size: 17px; overflow-wrap: anywhere; }
+    .article > :first-child { margin-top: 0; }
+    .article h1, .article h2, .article h3, .article h4 { font-family: 'Noto Serif SC', serif; line-height: 1.25; margin-top: 1.7em; margin-bottom: 0.6em; }
+    .article h1 { font-size: clamp(34px, 4vw, 48px); } .article h2 { font-size: clamp(26px, 3vw, 34px); } .article h3 { font-size: clamp(22px, 2vw, 28px); }
+    .article p, .article li { color: #e3ebfa; } .article strong { color: #ffffff; }
+    .article blockquote { margin: 1.4em 0; padding: 14px 18px; border-left: 3px solid var(--accent); background: rgba(255, 193, 99, 0.08); color: #ffe8c7; border-radius: 0 14px 14px 0; }
+    .article code { padding: 0.16em 0.42em; border-radius: 8px; background: rgba(119, 213, 255, 0.12); color: #bcecff; font-family: Consolas, monospace; }
+    .article pre { padding: 18px; overflow: auto; border-radius: 18px; border: 1px solid rgba(119, 213, 255, 0.16); background: #050d18; }
+    .article pre code { padding: 0; background: transparent; color: #d8ebff; }
+    .article table { width: 100%; border-collapse: collapse; margin: 1.5em 0; border-radius: 16px; border: 1px solid var(--line); overflow: hidden; }
+    .article th, .article td { padding: 12px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .article th { background: rgba(119, 213, 255, 0.1); color: white; }
+    .article img { max-width: 100%; border-radius: 18px; display: block; margin: 1.5em auto; box-shadow: var(--shadow); }
+    .module-nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 18px; }
+    .module-link { display: flex; flex-direction: column; gap: 6px; padding: 14px 16px; border-radius: 18px; border: 1px solid var(--line); background: rgba(10, 22, 39, 0.56); color: var(--text); text-decoration: none; }
+    .module-link:hover { border-color: var(--accent-2); background: rgba(16, 30, 50, 0.88); }
+    .module-link.center { align-items: center; justify-content: center; text-align: center; }
+    .module-link small { color: var(--muted); font-size: 12px; }
+    .module-link strong { font-size: 15px; }
+    .footer-note { margin-top: 18px; color: var(--muted); font-size: 13px; }
+    @media (max-width: 1080px) { .shell { grid-template-columns: 1fr; } .sidebar { position: relative; height: auto; border-right: 0; border-bottom: 1px solid var(--line); } .tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); } .hero { position: relative; flex-direction: column; align-items: flex-start; } .meta-card { width: 100%; flex-basis: auto; } .module-nav { grid-template-columns: 1fr; } }
+    @media (max-width: 720px) { .main { padding: 18px 14px 32px; } .sidebar { padding: 18px 14px; } .tabs { grid-template-columns: 1fr; } .content-frame { padding: 22px 16px; border-radius: 22px; } .hero { padding: 16px; border-radius: 18px; } .brand h1 { font-size: 24px; } .article { font-size: 16px; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <section class="brand">
+        <div class="eyebrow">Learning Atlas</div>
+        <h1 id="moduleTitle">RAG</h1>
+        <p>掌握检索增强生成，从知识库构建、召回、重排到生成增强，理解 Agent + RAG 组合方式。</p>
+      </section>
+      <nav class="toolbar">
+        <a href="../index.html">返回总目录</a>
+        <button type="button" id="reloadButton">重新渲染当前内容</button>
+      </nav>
+      <section class="sequence"><a class="sequence-item" href="../01-Agent-Foundation/index.html"><span class="sequence-badge">01</span><span><strong>Agent Foundation</strong><br>基础认知</span></a>
+        <a class="sequence-item" href="../02-LLM-and-Prompting/index.html"><span class="sequence-badge">02</span><span><strong>LLM and Prompting</strong><br>模型能力</span></a>
+        <a class="sequence-item" href="../03-Tool-Use-and-Workflow/index.html"><span class="sequence-badge">03</span><span><strong>Tool Use and Workflow</strong><br>执行工作流</span></a>
+        <a class="sequence-item" href="../04-Memory-and-Planning/index.html"><span class="sequence-badge">04</span><span><strong>Memory and Planning</strong><br>记忆规划</span></a>
+        <a class="sequence-item active" href="../RAG/index.html"><span class="sequence-badge">05</span><span><strong>RAG</strong><br>检索增强</span></a>
+        <a class="sequence-item" href="../05-Multi-Agent-Systems/index.html"><span class="sequence-badge">06</span><span><strong>Multi-Agent Systems</strong><br>多体协作</span></a>
+        <a class="sequence-item" href="../06-Evaluation-and-Observability/index.html"><span class="sequence-badge">07</span><span><strong>Evaluation and Observability</strong><br>评测运维</span></a>
+        <a class="sequence-item" href="../07-Agent-Safety-and-Guardrails/index.html"><span class="sequence-badge">08</span><span><strong>Safety and Guardrails</strong><br>安全治理</span></a>
+        <a class="sequence-item" href="../08-Agent-Engineering-Projects/index.html"><span class="sequence-badge">09</span><span><strong>Engineering Projects</strong><br>项目实战</span></a></section>
+      <section class="tabs" id="tabs"></section>
+    </aside>
+    <main class="main">
+      <section class="hero">
+        <div class="hero-copy">
+          <div class="label">Module Navigator</div>
+          <h2 id="activeTitle">模块概览</h2>
+          <p id="activeDescription">通过突出导航栏和单页 TAB 切换快速浏览当前学习模块的完整知识结构。</p>
+        </div>
+        <div class="meta-card">
+          <div class="meta-k">当前文件</div>
+          <div class="meta-v" id="sourcePath">README.md</div>
+        </div>
+      </section>
+      <section class="content-frame">
+        <article class="article" id="content">正在加载内容…</article>
+        <nav class="module-nav"><a class="module-link" href="../04-Memory-and-Planning/index.html"><small>上一个模块</small><strong>04 · Memory and Planning</strong></a><a class="module-link center" href="../index.html"><small>总入口</small><strong>返回学习总目录</strong></a><a class="module-link" href="../05-Multi-Agent-Systems/index.html"><small>下一个模块</small><strong>06 · Multi-Agent Systems</strong></a></nav>
+        <div class="footer-note">提示：此页面已经内嵌 Markdown 内容，直接双击打开 index.html 也可正常切换，不依赖本地静态服务。</div>
+      </section>
+    </main>
+  </div>
+  <script id="tabs-data" type="application/json">[{"id": "overview", "label": "模块概览", "path": "README.md", "description": "先看模块目标、适合人群与整体导航。"}, {"id": "roadmap", "label": "学习路线", "path": "md/learning-roadmap.md", "description": "按阶段拆解学习顺序与关键目标。"}, {"id": "glossary", "label": "术语表", "path": "md/glossary.md", "description": "统一关键术语与易混概念。"}, {"id": "projects", "label": "实践项目", "path": "md/practice-projects.md", "description": "通过项目练习把知识变成产出。"}, {"id": "interview", "label": "面试题", "path": "md/interview-questions.md", "description": "检验理解深度，训练结构化表达。"}, {"id": "checklist", "label": "学习清单", "path": "md/checklist.md", "description": "用完成标准快速核对掌握程度。"}]</script>
+  <script id="markdown-data" type="application/json">{"overview": "# RAG 学习模块\n\n## 模块简介\n本模块聚焦检索增强生成（RAG）的核心理论与工程实践，帮助你建立从知识库构建、检索召回、重排到生成增强的完整认知，并理解 RAG 如何与 Agent 系统协同工作。\n\n## 你将学到\n- RAG 的基本组成与工作流程\n- 文档切分、向量化、召回与重排\n- 检索质量、生成质量与系统评估\n- Agent + RAG 组合系统的设计思路\n\n## 推荐学习顺序\n1. **hello-agents**：最适合先学。它是系统化中文教程，覆盖 Agent 基础、框架实践、记忆与检索、上下文工程与评估，适合先建立完整认知框架。\n2. **claude-mem**：第二个学。它更偏真实工程实现，重点看持久记忆、检索、向量搜索、hook 流程和 worker 架构，适合把前面的概念落到可运行系统上。\n3. **ruflo**：最后学。它规模最大、概念最密，偏多智能体编排与平台化能力，适合在你已经熟悉 Agent + Memory/RAG 基础后再拆解。\n\n## 三个仓库的学习入口\n\n### 1. hello-agents\n- 仓库位置：[`./hello-agents`](./hello-agents)\n- 适合阶段：入门到进阶\n- 推荐先看：\n  - [`hello-agents/README.md`](./hello-agents/README.md)\n  - [`hello-agents/docs/chapter1/第一章 初识智能体.md`](./hello-agents/docs/chapter1/%E7%AC%AC%E4%B8%80%E7%AB%A0%20%E5%88%9D%E8%AF%86%E6%99%BA%E8%83%BD%E4%BD%93.md)\n  - [`hello-agents/docs/chapter8/第八章 记忆与检索.md`](./hello-agents/docs/chapter8/%E7%AC%AC%E5%85%AB%E7%AB%A0%20%E8%AE%B0%E5%BF%86%E4%B8%8E%E6%A3%80%E7%B4%A2.md)\n  - [`hello-agents/code`](./hello-agents/code)\n- 学习重点：\n  - 先建立 Agent 与 RAG 的全局地图\n  - 理解“记忆、检索、上下文工程、评估”在系统中的角色\n  - 配合 `code/` 目录做章节式实践\n\n### 2. claude-mem\n- 仓库位置：[`./claude-mem`](./claude-mem)\n- 适合阶段：工程实现拆解\n- 推荐先看：\n  - [`claude-mem/README.md`](./claude-mem/README.md)\n  - [`claude-mem/CLAUDE.md`](./claude-mem/CLAUDE.md)\n  - [`claude-mem/src/hooks`](./claude-mem/src/hooks)\n  - [`claude-mem/src/services`](./claude-mem/src/services)\n  - [`claude-mem/plugin/skills/mem-search`](./claude-mem/plugin/skills/mem-search)\n- 学习重点：\n  - hook 如何采集上下文并写入记忆系统\n  - worker service、SQLite、Chroma 如何协同形成检索链路\n  - memory search 如何服务后续会话与 Agent 工作流\n\n### 3. ruflo\n- 仓库位置：[`./ruflo`](./ruflo)\n- 适合阶段：高级编排与平台化\n- 推荐先看：\n  - [`ruflo/README.md`](./ruflo/README.md)\n  - [`ruflo/CLAUDE.md`](./ruflo/CLAUDE.md)\n  - [`ruflo/v3`](./ruflo/v3)\n  - [`ruflo/plugin`](./ruflo/plugin)\n  - [`ruflo/tests`](./ruflo/tests)\n- 学习重点：\n  - 多智能体编排、记忆、路由、工具系统如何组合成平台\n  - 理解大规模 Agent orchestration 与 RAG/Memory 的关系\n  - 重点看 v3 架构，而不是一开始就试图全部读完\n\n## 建议学习方法\n- 第 1 轮：只读 README 和目录结构，建立全局地图\n- 第 2 轮：优先精读 `hello-agents` 的相关章节，再对照 `claude-mem` 的实现\n- 第 3 轮：最后再进入 `ruflo`，只抓主线：路由、记忆、agent coordination、plugin/MCP\n- 每读完一个仓库，补一份自己的“系统图 + 数据流 + 核心模块”笔记\n\n## 学习导航\n- 学习路线：[`md/learning-roadmap.md`](./md/learning-roadmap.md)\n- 术语表：[`md/glossary.md`](./md/glossary.md)\n- 实践项目：[`md/practice-projects.md`](./md/practice-projects.md)\n- 面试题：[`md/interview-questions.md`](./md/interview-questions.md)\n- 学习清单：[`md/checklist.md`](./md/checklist.md)\n- 返回总目录：[`../README.md`](../README.md)\n", "roadmap": "# RAG 学习路线\n\n## 1. 学习目标\n掌握 RAG 的完整链路，理解知识是如何进入系统、如何被召回、如何参与生成，以及如何与 Agent 的规划和工具调用能力结合。\n\n## 2. 核心知识点\n- RAG 基本架构：索引、检索、增强生成\n- 文档清洗、切分与 chunk 策略\n- Embedding、向量数据库、召回策略\n- 重排（Rerank）与上下文构造\n- RAG 的评估与幻觉控制\n- Agent + RAG 的边界与组合方式\n\n## 3. 学习顺序\n### 阶段一：基础认知\n- 为什么需要 RAG\n- RAG 和微调的区别\n- 基础检索流程\n\n### 阶段二：工程实现\n- 文档切分策略\n- 检索召回与 Top-K\n- 重排与上下文拼装\n\n### 阶段三：系统优化\n- 召回率与准确率平衡\n- 降低幻觉与无关上下文\n- 与 Agent 规划、记忆、工具调用集成\n\n## 4. 建议产出\n- 搭建一个最小 RAG Demo\n- 对比不同 chunk 策略的效果\n- 设计一个 Agent + RAG 组合案例\n\n## 5. 进阶衔接\n完成后可回到：`../05-Multi-Agent-Systems/README.md`，继续学习复杂 Agent 系统如何消费检索能力。\n", "glossary": "# RAG 术语表\n\n## 核心术语\n- **RAG**：Retrieval-Augmented Generation，检索增强生成。\n- **Chunk**：文档切分后的最小检索单元。\n- **Embedding**：将文本映射为向量表示的方法。\n- **Retriever**：负责召回相关内容的检索模块。\n- **Reranker**：对召回结果二次排序的模块。\n- **Context Window**：模型一次能处理的上下文范围。\n- **Hallucination**：模型生成与事实不一致内容的现象。\n\n## 常见易混淆概念\n- **RAG vs 微调**：RAG 偏向外部知识注入，微调偏向模型参数层适配。\n- **召回 vs 重排**：召回追求找全，重排追求找准。\n- **记忆 vs 检索**：记忆偏长期状态，检索偏按需取用外部知识。\n", "projects": "# RAG 实践项目\n\n## 入门项目：FAQ 检索问答\n- 目标：对固定知识文档做问答。\n- 交付物：可查询的本地 RAG Demo。\n- 验收标准：能够返回引用片段并给出简洁回答。\n\n## 进阶项目：企业知识库助手\n- 目标：支持多文档、多主题问答与来源追踪。\n- 交付物：带检索日志与来源展示的应用。\n- 验收标准：能区分不同知识来源，并降低无依据回答。\n\n## 综合项目：Agent + RAG 助手\n- 目标：让 Agent 在执行任务前先检索知识，再决定是否调用工具。\n- 交付物：具备检索、规划、执行闭环的原型系统。\n- 验收标准：能根据检索结果调整后续行动路径。\n", "interview": "# RAG 面试题\n\n## 基础题\n1. RAG 的完整链路包含哪些步骤？\n2. 为什么 RAG 可以缓解大模型知识过时问题？\n3. Chunk 切分策略为什么会影响最终回答质量？\n\n## 场景题\n1. 如果召回结果很多但回答质量依旧差，你会如何排查？\n2. 如果用户问题跨多个文档来源，如何提升上下文构造质量？\n3. 在 Agent 系统中，什么情况下应该优先检索而不是直接调用工具？\n\n## 开放题\n1. 你认为 RAG 和 Agent 的关系是什么？\n2. 如果让你设计一个可评测的企业级 RAG 系统，你会关注哪些指标？\n", "checklist": "# RAG 学习清单\n\n## 基础完成\n- [ ] 能解释 RAG 的定义与价值\n- [ ] 能说明索引、检索、生成之间的关系\n- [ ] 能理解 chunk、embedding、rerank 的作用\n\n## 工程完成\n- [ ] 能搭建一个最小 RAG Demo\n- [ ] 能对比至少两种 chunk 策略\n- [ ] 能分析一次检索失败案例\n\n## 进阶完成\n- [ ] 能说明 RAG 与记忆、工具、Agent 的边界\n- [ ] 能为 RAG 系统设计评估指标\n- [ ] 能设计一个 Agent + RAG 组合方案\n"}</script>
+  <script>
+    const tabs = JSON.parse(document.getElementById('tabs-data').textContent);
+    const markdownMap = JSON.parse(document.getElementById('markdown-data').textContent);
+    const tabsRoot = document.getElementById('tabs');
+    const content = document.getElementById('content');
+    const activeTitle = document.getElementById('activeTitle');
+    const activeDescription = document.getElementById('activeDescription');
+    const sourcePath = document.getElementById('sourcePath');
+    const reloadButton = document.getElementById('reloadButton');
+    const hasMarked = typeof window.marked !== 'undefined' && typeof window.marked.parse === 'function';
+    if (hasMarked) {
+      marked.setOptions({ breaks: true, gfm: true });
+    }
+
+    function escapeHtml(text) {
+      return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+
+    function fallbackMarkdownToHtml(markdown) {
+      const escaped = escapeHtml(markdown);
+      return '<pre style="white-space:pre-wrap;line-height:1.8;">' + escaped + '</pre>';
+    }
+
+    function renderMarkdown(markdown) {
+      if (hasMarked) {
+        try {
+          return marked.parse(markdown);
+        } catch (e) {
+          return fallbackMarkdownToHtml(markdown);
+        }
+      }
+      return fallbackMarkdownToHtml(markdown);
+    }
+
+    function renderTabs(activeId) {
+      tabsRoot.innerHTML = '';
+      tabs.forEach((item) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'tab' + (item.id === activeId ? ' active' : '');
+        button.innerHTML = '<strong>' + item.label + '</strong><span>' + item.description + '</span>';
+        button.addEventListener('click', () => loadTab(item.id));
+        tabsRoot.appendChild(button);
+      });
+    }
+
+    function loadTab(id) {
+      const current = tabs.find((item) => item.id === id) || tabs[0];
+      renderTabs(current.id);
+      activeTitle.textContent = current.label;
+      activeDescription.textContent = current.description;
+      sourcePath.textContent = current.path;
+      const markdown = markdownMap[current.id] || '# 内容缺失\n\n未找到对应内容。';
+      content.innerHTML = renderMarkdown(markdown);
+      if (location.hash !== '#' + current.id) {
+        history.replaceState(null, '', '#' + current.id);
+      }
+    }
+
+    reloadButton.addEventListener('click', () => {
+      const id = location.hash.replace('#', '') || tabs[0].id;
+      loadTab(id);
+    });
+
+    window.addEventListener('hashchange', () => {
+      const id = location.hash.replace('#', '');
+      if (tabs.some((item) => item.id === id)) {
+        loadTab(id);
+      }
+    });
+
+    loadTab(location.hash.replace('#', '') || tabs[0].id);
+  </script>
+</body>
+</html>
